@@ -60,7 +60,7 @@ static int g_is_running       = 0;
 static int g_mode_server      = 0;
 static int g_current_log_level = LOG_LEVEL_INFO;
 
-static void log_append(log_level_t level, const char *format, ...) {
+void log_append(int level, const char *format, ...) {
     if (level < g_current_log_level || !g_hEditLog) return;
 
     const char *tag = "[INFO] ";

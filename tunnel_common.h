@@ -207,11 +207,79 @@ static inline void derive_direction_key(const uint8_t master_key[32],
                                         const char *label,
                                         const uint8_t nonce[16],
                                         uint8_t out_key[32]) {
-    uint8_t salt[32];
+    uint8_t salt[64];
     size_t label_len = strlen(label);
     memcpy(salt, label, label_len);
     memcpy(salt + label_len, nonce, 16);
     lk_hmac_sha256(master_key, 32, salt, label_len + 16, out_key);
+}
+
+#define AUTH_NONCE_SIZE 16
+#define AUTH_TAG_SIZE   32
+#define AUTH_PACKET_SIZE (AUTH_NONCE_SIZE + AUTH_TAG_SIZE)
+
+/* Calculate authentication tag */
+static inline void compute_auth_tag(const uint8_t master_key[32],
+                                    const char *label,
+                                    const uint8_t nonce[AUTH_NONCE_SIZE],
+                                    uint8_t out_tag[AUTH_TAG_SIZE]) {
+    uint8_t data[64];
+    size_t label_len = strlen(label);
+    memcpy(data, label, label_len);
+    memcpy(data + label_len, nonce, AUTH_NONCE_SIZE);
+    lk_hmac_sha256(master_key, 32, data, label_len + AUTH_NONCE_SIZE, out_tag);
+}
+
+/* Perform client handshake authentication */
+static inline int client_authenticate(socket_t sock, const uint8_t master_key[32],
+                                      uint8_t c_nonce[AUTH_NONCE_SIZE],
+                                      uint8_t s_nonce[AUTH_NONCE_SIZE]) {
+    if (lk_random_bytes(c_nonce, AUTH_NONCE_SIZE) != 0) return -1;
+
+    uint8_t c_pkt[AUTH_PACKET_SIZE];
+    memcpy(c_pkt, c_nonce, AUTH_NONCE_SIZE);
+    compute_auth_tag(master_key, "LK-CLIENT-AUTH", c_nonce, c_pkt + AUTH_NONCE_SIZE);
+
+    if (write_exact(sock, c_pkt, AUTH_PACKET_SIZE) != 0) return -1;
+
+    uint8_t s_pkt[AUTH_PACKET_SIZE];
+    if (read_exact(sock, s_pkt, AUTH_PACKET_SIZE) != 0) return -1;
+
+    memcpy(s_nonce, s_pkt, AUTH_NONCE_SIZE);
+    uint8_t expected_s_tag[AUTH_TAG_SIZE];
+    compute_auth_tag(master_key, "LK-SERVER-AUTH", s_nonce, expected_s_tag);
+
+    if (memcmp(s_pkt + AUTH_NONCE_SIZE, expected_s_tag, AUTH_TAG_SIZE) != 0) {
+        return -2; /* Authentication failed: Invalid key */
+    }
+
+    return 0; /* Verified */
+}
+
+/* Perform server handshake authentication */
+static inline int server_authenticate(socket_t sock, const uint8_t master_key[32],
+                                      uint8_t c_nonce[AUTH_NONCE_SIZE],
+                                      uint8_t s_nonce[AUTH_NONCE_SIZE]) {
+    uint8_t c_pkt[AUTH_PACKET_SIZE];
+    if (read_exact(sock, c_pkt, AUTH_PACKET_SIZE) != 0) return -1;
+
+    memcpy(c_nonce, c_pkt, AUTH_NONCE_SIZE);
+    uint8_t expected_c_tag[AUTH_TAG_SIZE];
+    compute_auth_tag(master_key, "LK-CLIENT-AUTH", c_nonce, expected_c_tag);
+
+    if (memcmp(c_pkt + AUTH_NONCE_SIZE, expected_c_tag, AUTH_TAG_SIZE) != 0) {
+        return -2; /* Authentication failed: Invalid key */
+    }
+
+    if (lk_random_bytes(s_nonce, AUTH_NONCE_SIZE) != 0) return -1;
+
+    uint8_t s_pkt[AUTH_PACKET_SIZE];
+    memcpy(s_pkt, s_nonce, AUTH_NONCE_SIZE);
+    compute_auth_tag(master_key, "LK-SERVER-AUTH", s_nonce, s_pkt + AUTH_NONCE_SIZE);
+
+    if (write_exact(sock, s_pkt, AUTH_PACKET_SIZE) != 0) return -1;
+
+    return 0; /* Verified */
 }
 
 /* Helper to generate a random 32-byte cryptographic key as a hex string */

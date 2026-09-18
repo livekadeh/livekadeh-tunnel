@@ -54,7 +54,7 @@ static inline int run_linux_tun_server(int listen_port, const char *key) {
         return 1;
     }
 
-    printf("[Livekadeh VPN Server] TUN active on %s (10.10.10.1). Listening for clients on port %d...\n",
+    printf("[Livekadeh VPN Server] TUN active on %s (10.10.10.1). Listening on port %d...\n",
            dev, listen_port);
 
     uint8_t master_key[32];
@@ -68,15 +68,24 @@ static inline int run_linux_tun_server(int listen_port, const char *key) {
 
         set_tcp_nodelay(sock);
 
-        /* Handshake Nonce exchange */
-        uint8_t c_nonce[NONCE_SIZE];
-        uint8_t s_nonce[NONCE_SIZE];
-        if (read_exact(sock, c_nonce, NONCE_SIZE) != 0 ||
-            lk_random_bytes(s_nonce, NONCE_SIZE) != 0 ||
-            write_exact(sock, s_nonce, NONCE_SIZE) != 0) {
+        /* Set 3-second receive timeout for handshake authentication */
+        struct timeval tv_auth = { 3, 0 };
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv_auth, sizeof(tv_auth));
+
+        uint8_t c_nonce[AUTH_NONCE_SIZE];
+        uint8_t s_nonce[AUTH_NONCE_SIZE];
+
+        int auth_res = server_authenticate(sock, master_key, c_nonce, s_nonce);
+        if (auth_res != 0) {
+            printf("[Livekadeh VPN Server] Unauthorized probe or invalid key from %s (Rejected)\n",
+                   inet_ntoa(client_addr.sin_addr));
             CLOSE_SOCK(sock);
             continue;
         }
+
+        /* Reset receive timeout to 0 (normal blocking operation) */
+        struct timeval tv_zero = { 0, 0 };
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv_zero, sizeof(tv_zero));
 
         uint8_t key_c2s[32], key_s2c[32];
         derive_direction_key(master_key, "C2S", c_nonce, key_c2s);
@@ -86,7 +95,7 @@ static inline int run_linux_tun_server(int listen_port, const char *key) {
         lk_chacha20_init(&ctx_rx, key_c2s, c_nonce, 1);
         lk_chacha20_init(&ctx_tx, key_s2c, s_nonce, 1);
 
-        printf("[Livekadeh VPN Server] Client connected from %s! Tunneling L3 packets...\n",
+        printf("[Livekadeh VPN Server] Client authenticated from %s! Tunneling L3 packets...\n",
                inet_ntoa(client_addr.sin_addr));
 
         uint8_t buf[MAX_PACKET_SIZE];
@@ -135,46 +144,18 @@ typedef struct {
     char app_path[MAX_PATH];
 } win_tun_client_params_t;
 
+/* Forward declaration of log_append from gui_win32.h */
+void log_append(int level, const char *format, ...);
+
 static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
     win_tun_client_params_t *p = (win_tun_client_params_t *)arg;
 
-    if (wintun_load_dll() != 0) {
-        free(p);
-        return 1;
-    }
-
-    /* Create Wintun adapter */
-    WINTUN_ADAPTER_HANDLE adapter = pWintunCreateAdapter(L"LivekadehAdapter", L"Livekadeh", NULL);
-    if (!adapter) {
-        adapter = pWintunOpenAdapter(L"LivekadehAdapter");
-        if (!adapter) {
-            fprintf(stderr, "[Error] Failed to create or open Wintun adapter. Run as Administrator!\n");
-            free(p);
-            return 1;
-        }
-    }
-
-    /* Configure IP 10.10.10.2 / Gateway 10.10.10.1 / DNS 1.1.1.1 */
-    wintun_configure_ip("LivekadehAdapter", "10.10.10.2", "10.10.10.1", "1.1.1.1");
-
-    /* Setup WFP Per-App if requested */
-    if (strlen(p->app_path) > 0) {
-        wfp_setup_per_app(p->app_path, "10.10.10.2");
-    }
-
-    WINTUN_SESSION_HANDLE session = pWintunStartSession(adapter, 0x400000);
-    if (!session) {
-        fprintf(stderr, "[Error] Failed to start Wintun session.\n");
-        pWintunCloseAdapter(adapter);
-        free(p);
-        return 1;
-    }
-
+    /* Step 1: Connect to remote VPN server */
+    log_append(1 /* INFO */, "Connecting to tunnel server %s:%d...", p->server_host, p->server_port);
     socket_t sock = connect_remote(p->server_host, p->server_port);
     if (!IS_VALIDSOCK(sock)) {
-        fprintf(stderr, "[Error] Could not connect to VPN server %s:%d\n", p->server_host, p->server_port);
-        pWintunEndSession(session);
-        pWintunCloseAdapter(adapter);
+        log_append(3 /* ERROR */, "Cannot connect to server %s:%d. Verify IP, port, and firewall.",
+                   p->server_host, p->server_port);
         free(p);
         return 1;
     }
@@ -182,14 +163,59 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
     uint8_t master_key[32];
     derive_master_key(p->key, master_key);
 
-    /* Handshake Nonce exchange */
-    uint8_t c_nonce[NONCE_SIZE], s_nonce[NONCE_SIZE];
-    if (lk_random_bytes(c_nonce, NONCE_SIZE) != 0 ||
-        write_exact(sock, c_nonce, NONCE_SIZE) != 0 ||
-        read_exact(sock, s_nonce, NONCE_SIZE) != 0) {
+    /* Step 2: Perform cryptographic mutual authentication */
+    log_append(0 /* DEBUG */, "Sending challenge authentication probe...");
+    uint8_t c_nonce[AUTH_NONCE_SIZE], s_nonce[AUTH_NONCE_SIZE];
+    int auth_res = client_authenticate(sock, master_key, c_nonce, s_nonce);
+
+    if (auth_res == -2) {
+        log_append(3 /* ERROR */, "AUTHENTICATION FAILED: INVALID ENCRYPTION KEY! Server rejected connection.");
         CLOSE_SOCK(sock);
-        pWintunEndSession(session);
+        free(p);
+        return 1;
+    } else if (auth_res != 0) {
+        log_append(3 /* ERROR */, "Handshake timed out or connection dropped by server.");
+        CLOSE_SOCK(sock);
+        free(p);
+        return 1;
+    }
+
+    log_append(1 /* INFO */, "Authentication verified! Encryption key is valid.");
+
+    /* Step 3: Initialize Wintun adapter */
+    if (wintun_load_dll() != 0) {
+        log_append(3 /* ERROR */, "Failed to load wintun.dll! Make sure wintun.dll is in the same folder.");
+        CLOSE_SOCK(sock);
+        free(p);
+        return 1;
+    }
+
+    WINTUN_ADAPTER_HANDLE adapter = pWintunCreateAdapter(L"LivekadehAdapter", L"Livekadeh", NULL);
+    if (!adapter) {
+        adapter = pWintunOpenAdapter(L"LivekadehAdapter");
+        if (!adapter) {
+            log_append(3 /* ERROR */, "Cannot create or open Wintun adapter. Ensure running as Administrator!");
+            CLOSE_SOCK(sock);
+            free(p);
+            return 1;
+        }
+    }
+
+    /* Configure IP 10.10.10.2 without default gateway to prevent routing loops (fully hidden) */
+    log_append(1 /* INFO */, "Configuring adapter IP 10.10.10.2 (Subnet route: 10.10.10.0/24 -> 10.10.10.1)...");
+    wintun_configure_ip("LivekadehAdapter", "10.10.10.2", "255.255.255.0");
+
+    /* Setup WFP Per-App if requested */
+    if (strlen(p->app_path) > 0) {
+        log_append(1 /* INFO */, "Configuring WFP Per-App routing for: %s", p->app_path);
+        wfp_setup_per_app(p->app_path, "10.10.10.2");
+    }
+
+    WINTUN_SESSION_HANDLE session = pWintunStartSession(adapter, 0x400000);
+    if (!session) {
+        log_append(3 /* ERROR */, "Failed to start Wintun session.");
         pWintunCloseAdapter(adapter);
+        CLOSE_SOCK(sock);
         free(p);
         return 1;
     }
@@ -203,8 +229,8 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
     lk_chacha20_init(&ctx_rx, key_s2c, s_nonce, 1);
 
     HANDLE read_wait = pWintunGetReadWaitEvent(session);
-    printf("[Livekadeh VPN Client] Connected to %s:%d! Wintun L3 streaming active.\n",
-           p->server_host, p->server_port);
+    log_append(1 /* INFO */, "Tunnel active! All server ports are accessible via 10.10.10.1.");
+    log_append(1 /* INFO */, "Test with: 'ping 10.10.10.1' or 'ssh root@10.10.10.1'");
 
     uint8_t recv_buf[MAX_PACKET_SIZE];
 
@@ -218,7 +244,10 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
         int act = select((int)sock + 1, &read_fds, NULL, NULL, &tv);
         if (act > 0 && FD_ISSET(sock, &read_fds)) {
             uint16_t plen = 0;
-            if (recv_tun_packet(sock, &ctx_rx, recv_buf, &plen) != 0) break;
+            if (recv_tun_packet(sock, &ctx_rx, recv_buf, &plen) != 0) {
+                log_append(2 /* WARN */, "Server disconnected or stream interrupted.");
+                break;
+            }
 
             BYTE *out_pkt = pWintunAllocateSendPacket(session, (DWORD)plen);
             if (out_pkt) {
@@ -238,7 +267,7 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
         }
     }
 
-    printf("[Livekadeh VPN Client] Stopped.\n");
+    log_append(1 /* INFO */, "Tunnel disconnected.");
     wfp_cleanup();
     CLOSE_SOCK(sock);
     pWintunEndSession(session);
@@ -249,4 +278,3 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
 #endif
 
 #endif /* LIVEKADEH_TUN_PROTO_H */
-

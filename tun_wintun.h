@@ -59,20 +59,52 @@ static inline int wintun_load_dll(void) {
     return 0;
 }
 
-/* Configure IP and default route on the created adapter */
-static inline int wintun_configure_ip(const char *adapter_name, const char *ip, const char *gateway, const char *dns) {
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "netsh interface ipv4 set address name=\"%s\" source=static address=%s mask=255.255.255.0 gateway=%s",
-             adapter_name, ip, gateway);
-    system(cmd);
+/* Execute command completely hidden in background without flashing any CMD window */
+static inline int run_command_hidden(const char *cmd) {
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    memset(&pi, 0, sizeof(pi));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
 
-    if (dns && strlen(dns) > 0) {
-        snprintf(cmd, sizeof(cmd),
-                 "netsh interface ipv4 set dns name=\"%s\" static %s",
-                 adapter_name, dns);
-        system(cmd);
+    char cmd_line[1024];
+    snprintf(cmd_line, sizeof(cmd_line), "cmd.exe /c %s", cmd);
+
+    if (CreateProcessA(NULL, cmd_line, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 5000);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return 0;
     }
+    return -1;
+}
+
+/* Configure IP address and direct subnet route on the created adapter */
+static inline int wintun_configure_ip(const char *adapter_name, const char *ip, const char *netmask) {
+    char cmd[512];
+
+    /* Give Windows NDIS time to finish registering the interface */
+    Sleep(600);
+
+    /* Assign static IP without default gateway to avoid disrupting physical internet */
+    snprintf(cmd, sizeof(cmd),
+             "netsh interface ipv4 set address name=\"%s\" source=static address=%s mask=%s",
+             adapter_name, ip, netmask);
+    run_command_hidden(cmd);
+
+    /* Explicitly add on-link route to 10.10.10.0/24 through Wintun adapter */
+    snprintf(cmd, sizeof(cmd),
+             "netsh interface ipv4 add route 10.10.10.0/24 \"%s\" 10.10.10.1 metric=1",
+             adapter_name);
+    run_command_hidden(cmd);
+
+    /* Set MTU to 1420 */
+    snprintf(cmd, sizeof(cmd),
+             "netsh interface ipv4 set subinterface \"%s\" mtu=1420 store=persistent",
+             adapter_name);
+    run_command_hidden(cmd);
 
     return 0;
 }
