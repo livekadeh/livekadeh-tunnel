@@ -3,7 +3,7 @@ WIN_CC = x86_64-w64-mingw32-gcc
 WIN_RES = x86_64-w64-mingw32-windres
 CFLAGS = -O2 -Wall -Wextra
 LDFLAGS_LINUX = -pthread
-LDFLAGS_WIN = -lws2_32 -lcomctl32 -lcomdlg32 -lgdi32 -lfwpuclnt -lshell32 -mwindows -s
+LDFLAGS_WIN = -lws2_32 -lcomctl32 -lcomdlg32 -lgdi32 -lfwpuclnt -lshell32 -liphlpapi -lpsapi -mwindows -s
 
 BUILD_DIR = build
 

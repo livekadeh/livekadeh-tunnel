@@ -141,7 +141,9 @@ typedef struct {
     char server_host[256];
     int server_port;
     char key[512];
-    char app_path[MAX_PATH];
+    int is_per_app;
+    int num_apps;
+    char app_paths[MAX_PER_APPS][MAX_PATH];
 } win_tun_client_params_t;
 
 /* Forward declaration of log_append from gui_win32.h */
@@ -206,9 +208,12 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
     wintun_configure_ip("LivekadehAdapter", "10.10.10.2", "255.255.255.0");
 
     /* Setup WFP Per-App if requested */
-    if (strlen(p->app_path) > 0) {
-        log_append(1 /* INFO */, "Configuring WFP Per-App routing for: %s", p->app_path);
-        wfp_setup_per_app(p->app_path, "10.10.10.2");
+    if (p->is_per_app && p->num_apps > 0) {
+        log_append(1 /* INFO */, "Configuring WFP Per-App routing for %d applications...", p->num_apps);
+        for (int i = 0; i < p->num_apps; i++) {
+            log_append(0 /* DEBUG */, "  -> App: %s", p->app_paths[i]);
+        }
+        wfp_setup_per_apps((const char (*)[MAX_PATH])p->app_paths, p->num_apps, "10.10.10.2");
     }
 
     WINTUN_SESSION_HANDLE session = pWintunStartSession(adapter, 0x400000);

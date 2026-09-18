@@ -192,10 +192,15 @@ int main(int argc, char **argv) {
         if (tun_mode) {
 #ifdef _WIN32
             win_tun_client_params_t *p = (win_tun_client_params_t *)malloc(sizeof(win_tun_client_params_t));
+            memset(p, 0, sizeof(*p));
             snprintf(p->server_host, sizeof(p->server_host), "%s", server_host);
             p->server_port = server_port;
             snprintf(p->key, sizeof(p->key), "%s", key);
-            snprintf(p->app_path, sizeof(p->app_path), "%s", app_path);
+            if (strlen(app_path) > 0) {
+                p->is_per_app = 1;
+                p->num_apps = 1;
+                snprintf(p->app_paths[0], sizeof(p->app_paths[0]), "%s", app_path);
+            }
 
             HANDLE h = CreateThread(NULL, 0, win_tun_client_thread, p, 0, NULL);
             if (h) WaitForSingleObject(h, INFINITE);

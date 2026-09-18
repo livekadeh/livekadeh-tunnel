@@ -11,24 +11,36 @@
 #include <shellapi.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <string.h>
+#include <ctype.h>
 #include "tunnel_common.h"
 #include "tun_proto.h"
+#include "tun_wintun.h"
 
-#define IDC_RADIO_CLIENT     1001
-#define IDC_RADIO_SERVER     1002
-#define IDC_LABEL_ADDR       1003
-#define IDC_EDIT_ADDR        1004
-#define IDC_BTN_TEST         1005
-#define IDC_LABEL_KEY        1006
-#define IDC_EDIT_KEY         1007
-#define IDC_BTN_GENKEY       1008
-#define IDC_CHK_PERAPP       1009
-#define IDC_EDIT_APPPATH     1010
-#define IDC_BTN_BROWSE       1011
-#define IDC_BTN_TOGGLE       1012
-#define IDC_COMBO_LOGLEVEL   1013
-#define IDC_EDIT_LOG         1014
-#define IDC_BTN_CLEARLOG     1015
+#define IDC_RADIO_CLIENT       1001
+#define IDC_RADIO_SERVER       1002
+#define IDC_LABEL_ADDR         1003
+#define IDC_EDIT_ADDR          1004
+#define IDC_BTN_TEST           1005
+#define IDC_LABEL_KEY          1006
+#define IDC_EDIT_KEY           1007
+#define IDC_BTN_GENKEY         1008
+#define IDC_CHK_PERAPP         1009
+#define IDC_LIST_APPS          1010
+#define IDC_BTN_RUNNING_APPS   1011
+#define IDC_BTN_BROWSE         1012
+#define IDC_BTN_REMOVE_APP     1013
+#define IDC_BTN_CLEAR_APPS     1014
+#define IDC_BTN_TOGGLE         1015
+#define IDC_COMBO_LOGLEVEL     1016
+#define IDC_EDIT_LOG           1017
+#define IDC_BTN_CLEARLOG       1018
+
+#define IDC_PICKER_SEARCH      2001
+#define IDC_PICKER_LIST        2002
+#define IDC_PICKER_ADD         2003
+#define IDC_PICKER_REFRESH     2004
+#define IDC_PICKER_CLOSE       2005
 
 typedef enum {
     LOG_LEVEL_DEBUG = 0,
@@ -37,6 +49,17 @@ typedef enum {
     LOG_LEVEL_ERROR = 3
 } log_level_t;
 
+/* Selected per-app list */
+typedef struct {
+    char path[MAX_PATH];
+    char display_name[MAX_PATH + 64];
+} app_item_t;
+
+static app_item_t g_selected_apps[MAX_PER_APPS];
+static int g_num_selected_apps = 0;
+
+/* Main GUI Controls */
+static HWND g_hMainWnd       = NULL;
 static HWND g_hRadioClient   = NULL;
 static HWND g_hRadioServer   = NULL;
 static HWND g_hLabelAddr     = NULL;
@@ -46,8 +69,11 @@ static HWND g_hLabelKey      = NULL;
 static HWND g_hEditKey       = NULL;
 static HWND g_hBtnGenKey     = NULL;
 static HWND g_hChkPerApp     = NULL;
-static HWND g_hEditAppPath   = NULL;
+static HWND g_hListApps      = NULL;
+static HWND g_hBtnRunningApps = NULL;
 static HWND g_hBtnBrowse     = NULL;
+static HWND g_hBtnRemoveApp  = NULL;
+static HWND g_hBtnClearApps  = NULL;
 static HWND g_hBtnToggle     = NULL;
 static HWND g_hComboLogLevel = NULL;
 static HWND g_hEditLog       = NULL;
@@ -59,6 +85,13 @@ static HFONT  g_hTerminalFont  = NULL;
 static int g_is_running       = 0;
 static int g_mode_server      = 0;
 static int g_current_log_level = LOG_LEVEL_INFO;
+
+/* Process Picker State */
+static running_proc_t g_running_procs[256];
+static int g_num_running_procs = 0;
+static HWND g_hPickerDlg       = NULL;
+static HWND g_hPickerSearch    = NULL;
+static HWND g_hPickerList      = NULL;
 
 void log_append(int level, const char *format, ...) {
     if (level < g_current_log_level || !g_hEditLog) return;
@@ -114,12 +147,14 @@ static inline void ensure_admin_elevation(void) {
     }
 }
 
+/* Worker parameter structure for tunnel thread */
 typedef struct {
     int is_server;
     int is_per_app;
     char addr[256];
     char key[512];
-    char app_path[MAX_PATH];
+    int num_apps;
+    char app_paths[MAX_PER_APPS][MAX_PATH];
 } gui_worker_params_t;
 
 static DWORD WINAPI gui_tunnel_thread(LPVOID arg) {
@@ -136,7 +171,12 @@ static DWORD WINAPI gui_tunnel_thread(LPVOID arg) {
         parse_host_port(p->addr, tp->server_host, sizeof(tp->server_host), &server_port);
         tp->server_port = server_port;
         snprintf(tp->key, sizeof(tp->key), "%s", p->key);
-        snprintf(tp->app_path, sizeof(tp->app_path), "%s", p->is_per_app ? p->app_path : "");
+        tp->is_per_app = p->is_per_app;
+        tp->num_apps = p->num_apps;
+        for (int i = 0; i < p->num_apps; i++) {
+            strncpy(tp->app_paths[i], p->app_paths[i], MAX_PATH - 1);
+            tp->app_paths[i][MAX_PATH - 1] = '\0';
+        }
 
         log_append(LOG_LEVEL_INFO, "Initializing Wintun adapter for remote server %s:%d...", tp->server_host, tp->server_port);
         win_tun_client_thread(tp);
@@ -145,72 +185,278 @@ static DWORD WINAPI gui_tunnel_thread(LPVOID arg) {
     return 0;
 }
 
+/* Test tunnel reachability */
 static DWORD WINAPI test_connection_thread(LPVOID arg) {
-    char *addr = (char *)arg;
-    char host[256];
-    int port = 8443;
-    parse_host_port(addr, host, sizeof(host), &port);
+    (void)arg;
+    EnableWindow(g_hBtnTest, FALSE);
 
-    log_append(LOG_LEVEL_INFO, "Testing reachability to %s:%d...", host, port);
-    DWORD start_time = GetTickCount();
+    if (g_is_running && !g_mode_server) {
+        /* Test in-tunnel L3 connectivity to 10.10.10.1 */
+        log_append(LOG_LEVEL_INFO, "[In-Tunnel Test] Pinging 10.10.10.1 through Wintun adapter...");
+        DWORD rtt = 0, ttl = 0;
+        int res = wintun_ping_tunnel("10.10.10.1", 3000, &rtt, &ttl);
+        if (res == 0) {
+            log_append(LOG_LEVEL_INFO, "[In-Tunnel Test] SUCCESS: Reply from 10.10.10.1: bytes=32 time=%lu ms TTL=%lu", rtt, ttl);
+            log_append(LOG_LEVEL_INFO, "[In-Tunnel Test] Tunnel status: FULLY OPERATIONAL (L3 encapsulated packets OK)");
+        } else {
+            log_append(LOG_LEVEL_ERROR, "[In-Tunnel Test] TIMEOUT: 10.10.10.1 did not respond through adapter.");
+            log_append(LOG_LEVEL_WARN, "Verify that livekadeh-tunnel service is running on the server.");
+        }
+    } else {
+        /* Tunnel is idle or server mode: probe external server port and key */
+        char addr[256];
+        GetWindowTextA(g_hEditAddr, addr, sizeof(addr));
+        char key[512];
+        GetWindowTextA(g_hEditKey, key, sizeof(key));
 
-    socket_t s = connect_remote(host, port);
-    if (!IS_VALIDSOCK(s)) {
-        DWORD elapsed = GetTickCount() - start_time;
-        log_append(LOG_LEVEL_ERROR, "Cannot reach %s:%d (Failed after %lu ms). Verify IP, port, and firewall.",
-                   host, port, elapsed);
-        EnableWindow(g_hBtnTest, TRUE);
-        free(addr);
-        return 0;
-    }
+        char host[256];
+        int port = 8443;
+        parse_host_port(addr, host, sizeof(host), &port);
 
-    DWORD connect_time = GetTickCount() - start_time;
-    log_append(LOG_LEVEL_DEBUG, "TCP handshake completed in %lu ms", connect_time);
+        log_append(LOG_LEVEL_INFO, "[Server Probe] Probing external server %s:%d...", host, port);
+        DWORD start = GetTickCount();
+        socket_t s = connect_remote(host, port);
+        if (!IS_VALIDSOCK(s)) {
+            DWORD elapsed = GetTickCount() - start;
+            log_append(LOG_LEVEL_ERROR, "[Server Probe] Cannot reach %s:%d (Failed after %lu ms). Check IP and port.", host, port, elapsed);
+            EnableWindow(g_hBtnTest, TRUE);
+            return 0;
+        }
 
-    uint8_t probe_nonce[16];
-    lk_random_bytes(probe_nonce, 16);
-    if (write_exact(s, probe_nonce, 16) != 0) {
-        log_append(LOG_LEVEL_ERROR, "Failed to send probe nonce to %s:%d", host, port);
+        DWORD tcp_time = GetTickCount() - start;
+        log_append(LOG_LEVEL_DEBUG, "[Server Probe] TCP connected in %lu ms. Testing authentication probe...", tcp_time);
+
+        uint8_t master_key[32];
+        derive_master_key(key, master_key);
+        uint8_t c_nonce[AUTH_NONCE_SIZE], s_nonce[AUTH_NONCE_SIZE];
+
+        DWORD to = 3000;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
+
+        int auth = client_authenticate(s, master_key, c_nonce, s_nonce);
         CLOSE_SOCK(s);
-        EnableWindow(g_hBtnTest, TRUE);
-        free(addr);
-        return 0;
+
+        DWORD total_time = GetTickCount() - start;
+        if (auth == 0) {
+            log_append(LOG_LEVEL_INFO, "[Server Probe] SUCCESS: Server is ONLINE and key is VALID! (RTT: %lu ms)", total_time);
+            log_append(LOG_LEVEL_INFO, "[Server Probe] Click 'Connect Tunnel' to start virtual adapter and test L3 ping.");
+        } else if (auth == -2) {
+            log_append(LOG_LEVEL_ERROR, "[Server Probe] FAILED: Server is ONLINE but ENCRYPTION KEY IS INVALID!");
+        } else {
+            log_append(LOG_LEVEL_WARN, "[Server Probe] Server connected but handshake timed out.");
+        }
     }
 
-    DWORD timeout = 3000;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
-
-    uint8_t s_nonce[16];
-    if (read_exact(s, s_nonce, 16) != 0) {
-        log_append(LOG_LEVEL_WARN, "TCP connected (%lu ms) but tunnel handshake timed out", connect_time);
-        CLOSE_SOCK(s);
-        EnableWindow(g_hBtnTest, TRUE);
-        free(addr);
-        return 0;
-    }
-
-    DWORD total_time = GetTickCount() - start_time;
-    log_append(LOG_LEVEL_INFO, "SUCCESS: Tunnel server is ONLINE and responding! (RTT: %lu ms)", total_time);
-    log_append(LOG_LEVEL_DEBUG, "Server probe handshake confirmed: 16-byte nonce exchange verified");
-
-    CLOSE_SOCK(s);
     EnableWindow(g_hBtnTest, TRUE);
-    free(addr);
     return 0;
+}
+
+/* Helper to add an application to the per-app list */
+static void add_application_to_list(const char *path) {
+    if (!path || strlen(path) == 0) return;
+    if (g_num_selected_apps >= MAX_PER_APPS) {
+        MessageBoxA(g_hMainWnd, "Maximum number of applications reached (64).", "Limit Reached", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    /* Check duplicates */
+    for (int i = 0; i < g_num_selected_apps; i++) {
+        if (_stricmp(g_selected_apps[i].path, path) == 0) {
+            return;
+        }
+    }
+
+    /* Extract filename for display */
+    const char *pSlash = strrchr(path, '\\');
+    const char *fileName = pSlash ? (pSlash + 1) : path;
+
+    strncpy(g_selected_apps[g_num_selected_apps].path, path, MAX_PATH - 1);
+    g_selected_apps[g_num_selected_apps].path[MAX_PATH - 1] = '\0';
+
+    snprintf(g_selected_apps[g_num_selected_apps].display_name,
+             sizeof(g_selected_apps[g_num_selected_apps].display_name),
+             "%s  -  %s", fileName, path);
+
+    SendMessageA(g_hListApps, LB_ADDSTRING, 0, (LPARAM)g_selected_apps[g_num_selected_apps].display_name);
+    g_num_selected_apps++;
+
+    /* Automatically enable Per-App checkbox */
+    SendMessage(g_hChkPerApp, BM_SETCHECK, BST_CHECKED, 0);
+    log_append(LOG_LEVEL_INFO, "Added application to Per-App tunnel: %s", fileName);
+}
+
+/* Refresh the Process Picker listbox */
+static void refresh_picker_list(HWND hList, const char *search_filter) {
+    SendMessageA(hList, LB_RESETCONTENT, 0, 0);
+
+    for (int i = 0; i < g_num_running_procs; i++) {
+        if (search_filter && strlen(search_filter) > 0) {
+            char lower_filter[128];
+            strncpy(lower_filter, search_filter, sizeof(lower_filter) - 1);
+            lower_filter[sizeof(lower_filter) - 1] = '\0';
+            for (size_t k = 0; k < strlen(lower_filter); k++) lower_filter[k] = (char)tolower(lower_filter[k]);
+
+            char lower_name[MAX_PATH];
+            strncpy(lower_name, g_running_procs[i].exe_name, sizeof(lower_name) - 1);
+            lower_name[sizeof(lower_name) - 1] = '\0';
+            for (size_t k = 0; k < strlen(lower_name); k++) lower_name[k] = (char)tolower(lower_name[k]);
+
+            if (!strstr(lower_name, lower_filter)) continue;
+        }
+
+        char item_text[MAX_PATH + 64];
+        snprintf(item_text, sizeof(item_text), "%s  (PID: %lu)  -  %s",
+                 g_running_procs[i].exe_name, g_running_procs[i].pid, g_running_procs[i].full_path);
+
+        int idx = (int)SendMessageA(hList, LB_ADDSTRING, 0, (LPARAM)item_text);
+        SendMessageA(hList, LB_SETITEMDATA, (WPARAM)idx, (LPARAM)i);
+    }
+}
+
+/* Process Picker Window Procedure */
+static LRESULT CALLBACK ProcessPickerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+            HWND hLblSearch = CreateWindowExA(0, "STATIC", "Filter Running Processes:",
+                WS_VISIBLE | WS_CHILD, 15, 12, 200, 18, hwnd, NULL, NULL, NULL);
+            SendMessage(hLblSearch, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+            g_hPickerSearch = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
+                WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL, 15, 32, 455, 24, hwnd, (HMENU)IDC_PICKER_SEARCH, NULL, NULL);
+            SendMessage(g_hPickerSearch, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+            HWND hLblList = CreateWindowExA(0, "STATIC", "Select running process(es) to add to tunnel list:",
+                WS_VISIBLE | WS_CHILD, 15, 64, 455, 18, hwnd, NULL, NULL, NULL);
+            SendMessage(hLblList, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+            g_hPickerList = CreateWindowExA(WS_EX_CLIENTEDGE, "LISTBOX", "",
+                WS_VISIBLE | WS_CHILD | WS_VSCROLL | LBS_NOTIFY | LBS_EXTENDEDSEL | WS_BORDER,
+                15, 84, 455, 235, hwnd, (HMENU)IDC_PICKER_LIST, NULL, NULL);
+            SendMessage(g_hPickerList, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+            HWND hBtnAdd = CreateWindowExA(0, "BUTTON", "Add Selected",
+                WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON, 15, 328, 140, 28, hwnd, (HMENU)IDC_PICKER_ADD, NULL, NULL);
+            SendMessage(hBtnAdd, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+            HWND hBtnRefresh = CreateWindowExA(0, "BUTTON", "Refresh",
+                WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 165, 328, 100, 28, hwnd, (HMENU)IDC_PICKER_REFRESH, NULL, NULL);
+            SendMessage(hBtnRefresh, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+            HWND hBtnClose = CreateWindowExA(0, "BUTTON", "Close",
+                WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 370, 328, 100, 28, hwnd, (HMENU)IDC_PICKER_CLOSE, NULL, NULL);
+            SendMessage(hBtnClose, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+            g_num_running_procs = get_running_processes(g_running_procs, 256);
+            refresh_picker_list(g_hPickerList, "");
+            break;
+        }
+
+        case WM_COMMAND: {
+            int wmId = LOWORD(wParam);
+            int wmEvent = HIWORD(wParam);
+
+            if (wmId == IDC_PICKER_SEARCH && wmEvent == EN_CHANGE) {
+                char filter[128];
+                GetWindowTextA(g_hPickerSearch, filter, sizeof(filter));
+                refresh_picker_list(g_hPickerList, filter);
+            } else if (wmId == IDC_PICKER_REFRESH) {
+                g_num_running_procs = get_running_processes(g_running_procs, 256);
+                char filter[128];
+                GetWindowTextA(g_hPickerSearch, filter, sizeof(filter));
+                refresh_picker_list(g_hPickerList, filter);
+            } else if (wmId == IDC_PICKER_ADD || (wmId == IDC_PICKER_LIST && wmEvent == LBN_DBLCLK)) {
+                int selCount = (int)SendMessageA(g_hPickerList, LB_GETSELCOUNT, 0, 0);
+                if (selCount > 0) {
+                    int *selIndices = (int *)malloc(sizeof(int) * selCount);
+                    if (selIndices) {
+                        SendMessageA(g_hPickerList, LB_GETSELITEMS, (WPARAM)selCount, (LPARAM)selIndices);
+                        for (int i = 0; i < selCount; i++) {
+                            int procIdx = (int)SendMessageA(g_hPickerList, LB_GETITEMDATA, (WPARAM)selIndices[i], 0);
+                            if (procIdx >= 0 && procIdx < g_num_running_procs) {
+                                add_application_to_list(g_running_procs[procIdx].full_path);
+                            }
+                        }
+                        free(selIndices);
+                    }
+                }
+                DestroyWindow(hwnd);
+            } else if (wmId == IDC_PICKER_CLOSE) {
+                DestroyWindow(hwnd);
+            }
+            break;
+        }
+
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            break;
+
+        case WM_DESTROY:
+            if (g_hMainWnd) EnableWindow(g_hMainWnd, TRUE);
+            SetForegroundWindow(g_hMainWnd);
+            g_hPickerDlg = NULL;
+            break;
+
+        default:
+            return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+    return 0;
+}
+
+/* Open the Process Picker dialog */
+static void show_process_picker_dialog(HWND hParent) {
+    if (g_hPickerDlg) {
+        SetForegroundWindow(g_hPickerDlg);
+        return;
+    }
+
+    HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(hParent, GWLP_HINSTANCE);
+
+    WNDCLASSA wc;
+    memset(&wc, 0, sizeof(wc));
+    wc.lpfnWndProc   = ProcessPickerWndProc;
+    wc.hInstance     = hInst;
+    wc.lpszClassName = "LivekadehProcPicker";
+    wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    RegisterClassA(&wc);
+
+    RECT rcParent;
+    GetWindowRect(hParent, &rcParent);
+    int dlg_w = 495;
+    int dlg_h = 405;
+    int dlg_x = rcParent.left + (rcParent.right - rcParent.left - dlg_w) / 2;
+    int dlg_y = rcParent.top + (rcParent.bottom - rcParent.top - dlg_h) / 2;
+
+    EnableWindow(hParent, FALSE);
+
+    g_hPickerDlg = CreateWindowExA(
+        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        "LivekadehProcPicker",
+        "Select Running Application",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        dlg_x, dlg_y, dlg_w, dlg_h,
+        hParent, NULL, hInst, NULL
+    );
 }
 
 static void update_mode_ui(void) {
     if (g_mode_server) {
         SetWindowTextA(g_hLabelAddr, "Tunnel Listen Address (Host:Port):");
         SetWindowTextA(g_hEditAddr, "0.0.0.0:8443");
-        SetWindowPos(g_hEditAddr, NULL, 20, 68, 520, 24, SWP_NOZORDER);
+        SetWindowPos(g_hEditAddr, NULL, 20, 68, 540, 24, SWP_NOZORDER);
         ShowWindow(g_hBtnTest, SW_HIDE);
         SetWindowTextA(g_hLabelKey, "Encryption Key:");
         ShowWindow(g_hBtnGenKey, SW_SHOW);
-        SetWindowPos(g_hEditKey, NULL, 20, 120, 390, 24, SWP_NOZORDER);
+        SetWindowPos(g_hEditKey, NULL, 20, 120, 400, 24, SWP_NOZORDER);
+
         ShowWindow(g_hChkPerApp, SW_HIDE);
-        ShowWindow(g_hEditAppPath, SW_HIDE);
+        ShowWindow(g_hListApps, SW_HIDE);
+        ShowWindow(g_hBtnRunningApps, SW_HIDE);
         ShowWindow(g_hBtnBrowse, SW_HIDE);
+        ShowWindow(g_hBtnRemoveApp, SW_HIDE);
+        ShowWindow(g_hBtnClearApps, SW_HIDE);
     } else {
         SetWindowTextA(g_hLabelAddr, "Server Address (IP:Port):");
         SetWindowTextA(g_hEditAddr, "2.59.170.232:8443");
@@ -218,16 +464,21 @@ static void update_mode_ui(void) {
         ShowWindow(g_hBtnTest, SW_SHOW);
         SetWindowTextA(g_hLabelKey, "Encryption Key (Paste key from server):");
         ShowWindow(g_hBtnGenKey, SW_HIDE);
-        SetWindowPos(g_hEditKey, NULL, 20, 120, 520, 24, SWP_NOZORDER);
+        SetWindowPos(g_hEditKey, NULL, 20, 120, 540, 24, SWP_NOZORDER);
+
         ShowWindow(g_hChkPerApp, SW_SHOW);
-        ShowWindow(g_hEditAppPath, SW_SHOW);
+        ShowWindow(g_hListApps, SW_SHOW);
+        ShowWindow(g_hBtnRunningApps, SW_SHOW);
         ShowWindow(g_hBtnBrowse, SW_SHOW);
+        ShowWindow(g_hBtnRemoveApp, SW_SHOW);
+        ShowWindow(g_hBtnClearApps, SW_SHOW);
     }
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
+            g_hMainWnd = hwnd;
             HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 
             g_hTerminalBrush = CreateSolidBrush(RGB(15, 23, 42));
@@ -238,13 +489,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             /* Mode Radios */
             g_hRadioClient = CreateWindowExA(0, "BUTTON", "Client Mode (Wintun Virtual Network Adapter)",
                 WS_VISIBLE | WS_CHILD | BS_AUTORADIOBUTTON | WS_GROUP,
-                20, 15, 330, 22, hwnd, (HMENU)IDC_RADIO_CLIENT, NULL, NULL);
+                20, 15, 340, 22, hwnd, (HMENU)IDC_RADIO_CLIENT, NULL, NULL);
             SendMessage(g_hRadioClient, WM_SETFONT, (WPARAM)hFont, TRUE);
             SendMessage(g_hRadioClient, BM_SETCHECK, BST_CHECKED, 0);
 
             g_hRadioServer = CreateWindowExA(0, "BUTTON", "Server Mode",
                 WS_VISIBLE | WS_CHILD | BS_AUTORADIOBUTTON,
-                360, 15, 170, 22, hwnd, (HMENU)IDC_RADIO_SERVER, NULL, NULL);
+                380, 15, 170, 22, hwnd, (HMENU)IDC_RADIO_SERVER, NULL, NULL);
             SendMessage(g_hRadioServer, WM_SETFONT, (WPARAM)hFont, TRUE);
 
             /* Server Address */
@@ -256,70 +507,85 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL, 20, 68, 380, 24, hwnd, (HMENU)IDC_EDIT_ADDR, NULL, NULL);
             SendMessage(g_hEditAddr, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-            /* Test Connection Button */
-            g_hBtnTest = CreateWindowExA(0, "BUTTON", "Test Connection",
-                WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 410, 67, 130, 26, hwnd, (HMENU)IDC_BTN_TEST, NULL, NULL);
+            /* Test Tunnel Button */
+            g_hBtnTest = CreateWindowExA(0, "BUTTON", "Test Tunnel",
+                WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 410, 67, 150, 26, hwnd, (HMENU)IDC_BTN_TEST, NULL, NULL);
             SendMessage(g_hBtnTest, WM_SETFONT, (WPARAM)hFont, TRUE);
 
             /* Key */
             g_hLabelKey = CreateWindowExA(0, "STATIC", "Encryption Key (Paste key from server):",
-                WS_VISIBLE | WS_CHILD, 20, 100, 520, 18, hwnd, (HMENU)IDC_LABEL_KEY, NULL, NULL);
+                WS_VISIBLE | WS_CHILD, 20, 100, 540, 18, hwnd, (HMENU)IDC_LABEL_KEY, NULL, NULL);
             SendMessage(g_hLabelKey, WM_SETFONT, (WPARAM)hFont, TRUE);
 
             g_hEditKey = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "0ddd412de196b2bf2110d54ec8c1fa9e1155af78cb770721d9de03034a2e6852",
-                WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL, 20, 120, 520, 24, hwnd, (HMENU)IDC_EDIT_KEY, NULL, NULL);
+                WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL, 20, 120, 540, 24, hwnd, (HMENU)IDC_EDIT_KEY, NULL, NULL);
             SendMessage(g_hEditKey, WM_SETFONT, (WPARAM)hFont, TRUE);
 
             g_hBtnGenKey = CreateWindowExA(0, "BUTTON", "Generate Key",
-                WS_CHILD | BS_PUSHBUTTON, 420, 119, 120, 26, hwnd, (HMENU)IDC_BTN_GENKEY, NULL, NULL);
+                WS_CHILD | BS_PUSHBUTTON, 430, 119, 130, 26, hwnd, (HMENU)IDC_BTN_GENKEY, NULL, NULL);
             SendMessage(g_hBtnGenKey, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-            /* Per-App Checkbox & Browse */
-            g_hChkPerApp = CreateWindowExA(0, "BUTTON", "Per-App Routing (Only route selected .exe through tunnel)",
-                WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 20, 153, 520, 20, hwnd, (HMENU)IDC_CHK_PERAPP, NULL, NULL);
+            /* Per-App Checkbox */
+            g_hChkPerApp = CreateWindowExA(0, "BUTTON", "Per-App Routing (Route only listed applications through tunnel)",
+                WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 20, 152, 540, 20, hwnd, (HMENU)IDC_CHK_PERAPP, NULL, NULL);
             SendMessage(g_hChkPerApp, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-            g_hEditAppPath = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
-                WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL, 20, 176, 420, 24, hwnd, (HMENU)IDC_EDIT_APPPATH, NULL, NULL);
-            SendMessage(g_hEditAppPath, WM_SETFONT, (WPARAM)hFont, TRUE);
+            /* Per-App ListBox */
+            g_hListApps = CreateWindowExA(WS_EX_CLIENTEDGE, "LISTBOX", "",
+                WS_VISIBLE | WS_CHILD | WS_VSCROLL | LBS_NOTIFY | WS_BORDER,
+                20, 175, 540, 75, hwnd, (HMENU)IDC_LIST_APPS, NULL, NULL);
+            SendMessage(g_hListApps, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-            g_hBtnBrowse = CreateWindowExA(0, "BUTTON", "Browse...",
-                WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 450, 175, 90, 26, hwnd, (HMENU)IDC_BTN_BROWSE, NULL, NULL);
+            /* Per-App Buttons */
+            g_hBtnRunningApps = CreateWindowExA(0, "BUTTON", "+ Running Apps...",
+                WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 20, 255, 140, 26, hwnd, (HMENU)IDC_BTN_RUNNING_APPS, NULL, NULL);
+            SendMessage(g_hBtnRunningApps, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+            g_hBtnBrowse = CreateWindowExA(0, "BUTTON", "+ Browse File...",
+                WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 168, 255, 120, 26, hwnd, (HMENU)IDC_BTN_BROWSE, NULL, NULL);
             SendMessage(g_hBtnBrowse, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+            g_hBtnRemoveApp = CreateWindowExA(0, "BUTTON", "Remove Selected",
+                WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 296, 255, 130, 26, hwnd, (HMENU)IDC_BTN_REMOVE_APP, NULL, NULL);
+            SendMessage(g_hBtnRemoveApp, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+            g_hBtnClearApps = CreateWindowExA(0, "BUTTON", "Clear All",
+                WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 434, 255, 126, 26, hwnd, (HMENU)IDC_BTN_CLEAR_APPS, NULL, NULL);
+            SendMessage(g_hBtnClearApps, WM_SETFONT, (WPARAM)hFont, TRUE);
 
             /* Connect/Disconnect Button */
             g_hBtnToggle = CreateWindowExA(0, "BUTTON", "Connect Tunnel",
-                WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON, 20, 212, 520, 36, hwnd, (HMENU)IDC_BTN_TOGGLE, NULL, NULL);
+                WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON, 20, 290, 540, 36, hwnd, (HMENU)IDC_BTN_TOGGLE, NULL, NULL);
             SendMessage(g_hBtnToggle, WM_SETFONT, (WPARAM)hFont, TRUE);
 
             /* Embedded Terminal Header & Log Level Selector */
             HWND hLabelTerm = CreateWindowExA(0, "STATIC", "Embedded Terminal & Live Connection Log:",
-                WS_VISIBLE | WS_CHILD, 20, 258, 300, 18, hwnd, NULL, NULL, NULL);
+                WS_VISIBLE | WS_CHILD, 20, 336, 300, 18, hwnd, NULL, NULL, NULL);
             SendMessage(hLabelTerm, WM_SETFONT, (WPARAM)hFont, TRUE);
 
             HWND hLabelLvl = CreateWindowExA(0, "STATIC", "Log Level:",
-                WS_VISIBLE | WS_CHILD, 335, 258, 70, 18, hwnd, NULL, NULL, NULL);
+                WS_VISIBLE | WS_CHILD, 355, 336, 70, 18, hwnd, NULL, NULL, NULL);
             SendMessage(hLabelLvl, WM_SETFONT, (WPARAM)hFont, TRUE);
 
             g_hComboLogLevel = CreateWindowExA(0, "COMBOBOX", "",
                 WS_VISIBLE | WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
-                410, 255, 130, 140, hwnd, (HMENU)IDC_COMBO_LOGLEVEL, NULL, NULL);
+                430, 333, 130, 140, hwnd, (HMENU)IDC_COMBO_LOGLEVEL, NULL, NULL);
             SendMessage(g_hComboLogLevel, WM_SETFONT, (WPARAM)hFont, TRUE);
             SendMessageA(g_hComboLogLevel, CB_ADDSTRING, 0, (LPARAM)"DEBUG");
             SendMessageA(g_hComboLogLevel, CB_ADDSTRING, 0, (LPARAM)"INFO");
             SendMessageA(g_hComboLogLevel, CB_ADDSTRING, 0, (LPARAM)"WARNING");
             SendMessageA(g_hComboLogLevel, CB_ADDSTRING, 0, (LPARAM)"ERROR");
-            SendMessageA(g_hComboLogLevel, CB_SETCURSEL, (WPARAM)1, 0); /* Default to INFO */
+            SendMessageA(g_hComboLogLevel, CB_SETCURSEL, (WPARAM)1, 0);
 
             /* Embedded Terminal Screen */
             g_hEditLog = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
                 WS_VISIBLE | WS_CHILD | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
-                20, 280, 520, 220, hwnd, (HMENU)IDC_EDIT_LOG, NULL, NULL);
+                20, 358, 540, 240, hwnd, (HMENU)IDC_EDIT_LOG, NULL, NULL);
             SendMessage(g_hEditLog, WM_SETFONT, (WPARAM)g_hTerminalFont, TRUE);
 
             /* Clear Log Button */
             g_hBtnClearLog = CreateWindowExA(0, "BUTTON", "Clear Terminal",
-                WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 430, 506, 110, 24, hwnd, (HMENU)IDC_BTN_CLEARLOG, NULL, NULL);
+                WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 440, 606, 120, 24, hwnd, (HMENU)IDC_BTN_CLEARLOG, NULL, NULL);
             SendMessage(g_hBtnClearLog, WM_SETFONT, (WPARAM)hFont, TRUE);
 
             log_append(LOG_LEVEL_INFO, "Livekadeh Tunnel ready. Running with Administrator privileges.");
@@ -332,7 +598,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             HWND hCtl = (HWND)lParam;
             if (hCtl == g_hEditLog) {
                 HDC hdc = (HDC)wParam;
-                SetTextColor(hdc, RGB(56, 189, 248));      /* Bright Sky Blue terminal font */
+                SetTextColor(hdc, RGB(56, 189, 248));      /* Bright Sky Blue */
                 SetBkColor(hdc, RGB(15, 23, 42));         /* Dark Navy Terminal Background */
                 return (INT_PTR)g_hTerminalBrush;
             }
@@ -362,10 +628,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             } else if (wmId == IDC_BTN_CLEARLOG) {
                 SetWindowTextA(g_hEditLog, "");
             } else if (wmId == IDC_BTN_TEST) {
-                char *addr = (char *)malloc(256);
-                GetWindowTextA(g_hEditAddr, addr, 256);
-                EnableWindow(g_hBtnTest, FALSE);
-                HANDLE h = CreateThread(NULL, 0, test_connection_thread, addr, 0, NULL);
+                HANDLE h = CreateThread(NULL, 0, test_connection_thread, NULL, 0, NULL);
                 if (h) CloseHandle(h);
             } else if (wmId == IDC_BTN_GENKEY) {
                 char new_key[128];
@@ -373,6 +636,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     SetWindowTextA(g_hEditKey, new_key);
                     log_append(LOG_LEVEL_INFO, "Generated new 256-bit encryption key.");
                 }
+            } else if (wmId == IDC_BTN_RUNNING_APPS) {
+                show_process_picker_dialog(hwnd);
             } else if (wmId == IDC_BTN_BROWSE) {
                 OPENFILENAMEA ofn;
                 char szFile[MAX_PATH] = "";
@@ -385,18 +650,34 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 ofn.nFilterIndex = 1;
                 ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
                 if (GetOpenFileNameA(&ofn)) {
-                    SetWindowTextA(g_hEditAppPath, szFile);
-                    SendMessage(g_hChkPerApp, BM_SETCHECK, BST_CHECKED, 0);
-                    log_append(LOG_LEVEL_INFO, "Selected application: %s", szFile);
+                    add_application_to_list(szFile);
                 }
+            } else if (wmId == IDC_BTN_REMOVE_APP) {
+                int cur = (int)SendMessageA(g_hListApps, LB_GETCURSEL, 0, 0);
+                if (cur != LB_ERR && cur < g_num_selected_apps) {
+                    log_append(LOG_LEVEL_INFO, "Removed application: %s", g_selected_apps[cur].path);
+                    SendMessageA(g_hListApps, LB_DELETESTRING, (WPARAM)cur, 0);
+                    for (int i = cur; i < g_num_selected_apps - 1; i++) {
+                        g_selected_apps[i] = g_selected_apps[i + 1];
+                    }
+                    g_num_selected_apps--;
+                }
+            } else if (wmId == IDC_BTN_CLEAR_APPS) {
+                SendMessageA(g_hListApps, LB_RESETCONTENT, 0, 0);
+                g_num_selected_apps = 0;
+                log_append(LOG_LEVEL_INFO, "Cleared application routing list.");
             } else if (wmId == IDC_BTN_TOGGLE) {
                 if (!g_is_running) {
                     gui_worker_params_t *p = (gui_worker_params_t *)malloc(sizeof(gui_worker_params_t));
                     p->is_server = g_mode_server;
                     p->is_per_app = (SendMessage(g_hChkPerApp, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    p->num_apps = g_num_selected_apps;
+                    for (int i = 0; i < g_num_selected_apps; i++) {
+                        snprintf(p->app_paths[i], sizeof(p->app_paths[i]), "%s", g_selected_apps[i].path);
+                    }
+
                     GetWindowTextA(g_hEditAddr, p->addr, sizeof(p->addr));
                     GetWindowTextA(g_hEditKey, p->key, sizeof(p->key));
-                    GetWindowTextA(g_hEditAppPath, p->app_path, sizeof(p->app_path));
 
                     if (strlen(p->key) == 0) {
                         if (p->is_server) {
@@ -419,14 +700,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     EnableWindow(g_hEditKey, FALSE);
                     EnableWindow(g_hBtnGenKey, FALSE);
                     EnableWindow(g_hChkPerApp, FALSE);
-                    EnableWindow(g_hEditAppPath, FALSE);
+                    EnableWindow(g_hListApps, FALSE);
+                    EnableWindow(g_hBtnRunningApps, FALSE);
                     EnableWindow(g_hBtnBrowse, FALSE);
+                    EnableWindow(g_hBtnRemoveApp, FALSE);
+                    EnableWindow(g_hBtnClearApps, FALSE);
 
                     if (g_mode_server) {
                         log_append(LOG_LEVEL_INFO, "Tunnel Server starting on %s...", p->addr);
                     } else {
-                        if (p->is_per_app && strlen(p->app_path) > 0) {
-                            log_append(LOG_LEVEL_INFO, "Starting Per-App VPN for %s -> %s", p->app_path, p->addr);
+                        if (p->is_per_app && p->num_apps > 0) {
+                            log_append(LOG_LEVEL_INFO, "Starting Per-App VPN for %d application(s) -> %s", p->num_apps, p->addr);
                         } else {
                             log_append(LOG_LEVEL_INFO, "Connecting to %s (All server ports accessible at 10.10.10.1)", p->addr);
                         }
@@ -445,8 +729,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     EnableWindow(g_hEditKey, TRUE);
                     if (g_mode_server) EnableWindow(g_hBtnGenKey, TRUE);
                     EnableWindow(g_hChkPerApp, TRUE);
-                    EnableWindow(g_hEditAppPath, TRUE);
+                    EnableWindow(g_hListApps, TRUE);
+                    EnableWindow(g_hBtnRunningApps, TRUE);
                     EnableWindow(g_hBtnBrowse, TRUE);
+                    EnableWindow(g_hBtnRemoveApp, TRUE);
+                    EnableWindow(g_hBtnClearApps, TRUE);
                     log_append(LOG_LEVEL_INFO, "Tunnel disconnected.");
                 }
             }
@@ -480,8 +767,8 @@ static inline int run_win32_gui(HINSTANCE hInstance, int nCmdShow) {
 
     RegisterClassA(&wc);
 
-    int win_w = 580;
-    int win_h = 580;
+    int win_w = 600;
+    int win_h = 680;
     int pos_x = (GetSystemMetrics(SM_CXSCREEN) - win_w) / 2;
     int pos_y = (GetSystemMetrics(SM_CYSCREEN) - win_h) / 2;
 
