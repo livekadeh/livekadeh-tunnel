@@ -85,26 +85,91 @@ static inline int run_command_hidden(const char *cmd) {
     return -1;
 }
 
-/* Configure IP address and direct subnet route on the created adapter */
-static inline int wintun_configure_ip(const char *adapter_name, const char *ip, const char *netmask) {
+static inline DWORD resolve_host_ipv4(const char *host) {
+    DWORD ip = inet_addr(host);
+    if (ip != INADDR_NONE) return ip;
+    struct hostent *he = gethostbyname(host);
+    if (he && he->h_addr_list && he->h_addr_list[0]) {
+        return *(DWORD *)he->h_addr_list[0];
+    }
+    return INADDR_NONE;
+}
+
+static inline int get_default_gateway_for_host(const char *host, char *out_gw, size_t gw_len, char *out_ip, size_t ip_len) {
+    DWORD dest = resolve_host_ipv4(host);
+    if (dest == INADDR_NONE) return -1;
+
+    struct in_addr resolved_addr;
+    resolved_addr.s_addr = dest;
+    if (out_ip && ip_len > 0) {
+        snprintf(out_ip, ip_len, "%s", inet_ntoa(resolved_addr));
+    }
+
+    MIB_IPFORWARDROW row;
+    memset(&row, 0, sizeof(row));
+    if (GetBestRoute(dest, 0, &row) == NO_ERROR) {
+        struct in_addr gw;
+        gw.s_addr = row.dwForwardNextHop;
+        if (gw.s_addr != 0 && out_gw && gw_len > 0) {
+            snprintf(out_gw, gw_len, "%s", inet_ntoa(gw));
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Configure IP address, internet routes, and physical gateway bypass */
+static inline int wintun_configure_ip(const char *adapter_name, const char *ip, const char *netmask, const char *server_host) {
     char cmd[512];
 
     /* Give Windows NDIS time to finish registering the interface */
     Sleep(600);
 
-    /* Assign static IP without default gateway to avoid disrupting physical internet */
+    /* 1. Assign static IP address without gateway */
     snprintf(cmd, sizeof(cmd),
              "netsh interface ipv4 set address name=\"%s\" source=static address=%s mask=%s",
              adapter_name, ip, netmask);
     run_command_hidden(cmd);
 
-    /* Explicitly add on-link route to 10.10.10.0/24 through Wintun adapter */
+    /* 2. Direct subnet route to 10.10.10.0/24 */
     snprintf(cmd, sizeof(cmd),
              "netsh interface ipv4 add route 10.10.10.0/24 \"%s\" 10.10.10.1 metric=1",
              adapter_name);
     run_command_hidden(cmd);
 
-    /* Set MTU to 1420 */
+    /* 3. Add explicit host route for VPN server IP through physical gateway so tunnel bypasses Wintun */
+    char phys_gw[64] = "";
+    char resolved_server_ip[64] = "";
+    if (server_host && strlen(server_host) > 0) {
+        if (get_default_gateway_for_host(server_host, phys_gw, sizeof(phys_gw), resolved_server_ip, sizeof(resolved_server_ip)) == 0) {
+            snprintf(cmd, sizeof(cmd), "route add %s mask 255.255.255.255 %s metric 1", resolved_server_ip, phys_gw);
+            run_command_hidden(cmd);
+        }
+    }
+
+    /* 4. Add the two /1 default routes into Wintun (0.0.0.0/1 and 128.0.0.0/1) */
+    snprintf(cmd, sizeof(cmd),
+             "netsh interface ipv4 add route 0.0.0.0/1 \"%s\" 10.10.10.1 metric=1",
+             adapter_name);
+    run_command_hidden(cmd);
+
+    snprintf(cmd, sizeof(cmd),
+             "netsh interface ipv4 add route 128.0.0.0/1 \"%s\" 10.10.10.1 metric=1",
+             adapter_name);
+    run_command_hidden(cmd);
+
+    /* 5. Set DNS to Cloudflare and Google */
+    snprintf(cmd, sizeof(cmd),
+             "netsh interface ipv4 set dnsservers name=\"%s\" static 1.1.1.1 validate=no",
+             adapter_name);
+    run_command_hidden(cmd);
+
+    snprintf(cmd, sizeof(cmd),
+             "netsh interface ipv4 add dnsservers name=\"%s\" 8.8.8.8 index=2 validate=no",
+             adapter_name);
+    run_command_hidden(cmd);
+
+    /* 6. Set MTU to 1420 */
     snprintf(cmd, sizeof(cmd),
              "netsh interface ipv4 set subinterface \"%s\" mtu=1420 store=persistent",
              adapter_name);
@@ -112,6 +177,28 @@ static inline int wintun_configure_ip(const char *adapter_name, const char *ip, 
 
     return 0;
 }
+
+/* Cleanup routes when tunnel disconnects */
+static inline void wintun_cleanup_routes(const char *adapter_name, const char *server_host) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "netsh interface ipv4 delete route 0.0.0.0/1 \"%s\" 10.10.10.1", adapter_name);
+    run_command_hidden(cmd);
+    snprintf(cmd, sizeof(cmd), "netsh interface ipv4 delete route 128.0.0.0/1 \"%s\" 10.10.10.1", adapter_name);
+    run_command_hidden(cmd);
+
+    char phys_gw[64] = "";
+    char resolved_server_ip[64] = "";
+    if (server_host && strlen(server_host) > 0) {
+        if (get_default_gateway_for_host(server_host, phys_gw, sizeof(phys_gw), resolved_server_ip, sizeof(resolved_server_ip)) == 0) {
+            snprintf(cmd, sizeof(cmd), "route delete %s", resolved_server_ip);
+            run_command_hidden(cmd);
+        } else {
+            snprintf(cmd, sizeof(cmd), "route delete %s", server_host);
+            run_command_hidden(cmd);
+        }
+    }
+}
+
 
 static const GUID GUID_FWPM_LAYER_ALE_AUTH_CONNECT_V4 =
     { 0xc38d57d1, 0x05a7, 0x4c33, { 0x90, 0x4f, 0x7f, 0xbc, 0xee, 0xe6, 0x0e, 0x82 } };

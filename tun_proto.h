@@ -151,6 +151,7 @@ void log_append(int level, const char *format, ...);
 
 static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
     win_tun_client_params_t *p = (win_tun_client_params_t *)arg;
+    g_tunnel_running = 1;
 
     /* Step 1: Connect to remote VPN server */
     log_append(1 /* INFO */, "Connecting to tunnel server %s:%d...", p->server_host, p->server_port);
@@ -203,9 +204,9 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
         }
     }
 
-    /* Configure IP 10.10.10.2 without default gateway to prevent routing loops (fully hidden) */
-    log_append(1 /* INFO */, "Configuring adapter IP 10.10.10.2 (Subnet route: 10.10.10.0/24 -> 10.10.10.1)...");
-    wintun_configure_ip("LivekadehAdapter", "10.10.10.2", "255.255.255.0");
+    /* Configure IP 10.10.10.2 and default internet routes through Wintun */
+    log_append(1 /* INFO */, "Configuring adapter IP 10.10.10.2 and routing traffic through tunnel...");
+    wintun_configure_ip("LivekadehAdapter", "10.10.10.2", "255.255.255.0", p->server_host);
 
     /* Setup WFP Per-App if requested */
     if (p->is_per_app && p->num_apps > 0) {
@@ -219,6 +220,7 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
     WINTUN_SESSION_HANDLE session = pWintunStartSession(adapter, 0x400000);
     if (!session) {
         log_append(3 /* ERROR */, "Failed to start Wintun session.");
+        wintun_cleanup_routes("LivekadehAdapter", p->server_host);
         pWintunCloseAdapter(adapter);
         CLOSE_SOCK(sock);
         free(p);
@@ -234,8 +236,8 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
     lk_chacha20_init(&ctx_rx, key_s2c, s_nonce, 1);
 
     HANDLE read_wait = pWintunGetReadWaitEvent(session);
-    log_append(1 /* INFO */, "Tunnel active! All server ports are accessible via 10.10.10.1.");
-    log_append(1 /* INFO */, "Test with: 'ping 10.10.10.1' or 'ssh root@10.10.10.1'");
+    log_append(1 /* INFO */, "Tunnel active! All traffic encrypted and routed via 10.10.10.1.");
+    log_append(1 /* INFO */, "Test in browser (whatismyip) or 'ping 10.10.10.1'");
 
     uint8_t recv_buf[MAX_PACKET_SIZE];
 
@@ -273,11 +275,17 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
     }
 
     log_append(1 /* INFO */, "Tunnel disconnected.");
+    wintun_cleanup_routes("LivekadehAdapter", p->server_host);
     wfp_cleanup();
     CLOSE_SOCK(sock);
     pWintunEndSession(session);
     pWintunCloseAdapter(adapter);
     free(p);
+
+    extern HWND g_hMainWnd;
+    if (g_hMainWnd) {
+        PostMessage(g_hMainWnd, WM_USER + 200, 0, 0);
+    }
     return 0;
 }
 #endif

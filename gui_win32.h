@@ -59,7 +59,7 @@ static app_item_t g_selected_apps[MAX_PER_APPS];
 static int g_num_selected_apps = 0;
 
 /* Main GUI Controls */
-static HWND g_hMainWnd       = NULL;
+HWND g_hMainWnd              = NULL;
 static HWND g_hRadioClient   = NULL;
 static HWND g_hRadioServer   = NULL;
 static HWND g_hLabelAddr     = NULL;
@@ -739,6 +739,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
             break;
         }
+
+        case WM_USER + 200:
+            g_is_running = 0;
+            SetWindowTextA(g_hBtnToggle, "Connect Tunnel");
+            EnableWindow(g_hRadioClient, TRUE);
+            EnableWindow(g_hRadioServer, TRUE);
+            EnableWindow(g_hEditAddr, TRUE);
+            EnableWindow(g_hEditKey, TRUE);
+            if (g_mode_server) EnableWindow(g_hBtnGenKey, TRUE);
+            EnableWindow(g_hChkPerApp, TRUE);
+            EnableWindow(g_hListApps, TRUE);
+            EnableWindow(g_hBtnRunningApps, TRUE);
+            EnableWindow(g_hBtnBrowse, TRUE);
+            EnableWindow(g_hBtnRemoveApp, TRUE);
+            EnableWindow(g_hBtnClearApps, TRUE);
+            break;
 
         case WM_DESTROY:
             stop_active_tunnel();
