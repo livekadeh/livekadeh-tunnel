@@ -14,14 +14,14 @@ $(BUILD_DIR):
 
 linux: main.c crypto.h tunnel_common.h menu_cli.h tun_proto.h tun_linux.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) main.c $(LDFLAGS_LINUX) -o $(BUILD_DIR)/livekadeh_tunnel
-	cp $(BUILD_DIR)/livekadeh_tunnel $(BUILD_DIR)/livekadeh
+	
 
 app.res: app.rc app.manifest app.ico
 	$(WIN_RES) app.rc -O coff -o app.res
 
 windows: main.c app.res crypto.h tunnel_common.h menu_cli.h tun_proto.h tun_wintun.h gui_win32.h | $(BUILD_DIR)
 	$(WIN_CC) $(CFLAGS) main.c app.res $(LDFLAGS_WIN) -o $(BUILD_DIR)/livekadeh_tunnel.exe
-	cp $(BUILD_DIR)/livekadeh_tunnel.exe $(BUILD_DIR)/livekadeh.exe
+	
 
 clean:
 	rm -f $(BUILD_DIR)/livekadeh $(BUILD_DIR)/livekadeh_tunnel $(BUILD_DIR)/livekadeh.exe $(BUILD_DIR)/livekadeh_tunnel.exe app.res
