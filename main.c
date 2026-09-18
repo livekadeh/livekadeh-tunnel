@@ -11,12 +11,12 @@
 #endif
 
 static void print_main_help(const char *prog) {
-    printf("Livekadeh Tunnel (لایوکده تانل) - Unified Transport & Per-App VPN\n\n");
+    printf("Livekadeh Tunnel - Unified Transport & Wintun VPN Adapter\n\n");
     printf("Usage:\n");
     printf("  %s <command> [options]\n\n", prog);
     printf("Commands:\n");
     printf("  server                Run in server mode\n");
-    printf("  client                Run in client mode\n");
+    printf("  client                Run in client mode (defaults to Wintun adapter on Windows)\n");
     printf("  genkey                Generate a fresh 256-bit encryption key\n");
     printf("  --menu                Launch interactive terminal menu\n");
 #ifdef _WIN32
@@ -26,23 +26,22 @@ static void print_main_help(const char *prog) {
 
     printf("Server Options:\n");
     printf("  -l, --listen <addr>   Listen address (default: 0.0.0.0:8443)\n");
-    printf("  -t, --target <addr>   Target service (default: 127.0.0.1:22)\n");
+    printf("  -t, --target <addr>   Target service (default: 127.0.0.1:22, ignored in --tun mode)\n");
     printf("  -k, --key <key>       Shared secret key (auto-generated if omitted)\n");
-    printf("      --tun             Enable L3 VPN mode (creates tun0 with NAT)\n\n");
+    printf("      --tun             Enable L3 VPN mode (all server ports accessible at 10.10.10.1)\n\n");
 
     printf("Client Options:\n");
     printf("  -s, --server <addr>   Remote tunnel server address (required)\n");
-    printf("  -l, --listen <addr>   Local listen address (default: 127.0.0.1:2222)\n");
     printf("  -k, --key <key>       Shared secret key (required)\n");
-    printf("      --tun             Enable Wintun L3 VPN adapter mode\n");
+    printf("  -l, --listen <addr>   Local listen address (port-forward mode only, default: 127.0.0.1:2222)\n");
+    printf("      --port-forward    Use single port forwarding instead of virtual adapter\n");
     printf("      --app <path>      Route only this app through tunnel (WFP Per-App)\n\n");
 
     printf("Examples:\n");
     printf("  %s genkey\n", prog);
-    printf("  %s server -l 0.0.0.0:8443 -t 127.0.0.1:22\n", prog);
-    printf("  %s server --tun -l 0.0.0.0:8443\n", prog);
-    printf("  %s client -s 5.160.109.229:8443 -l 127.0.0.1:2222 -k <key>\n", prog);
-    printf("  %s client -s 5.160.109.229:8443 --app \"C:\\Program Files\\App\\app.exe\" -k <key>\n", prog);
+    printf("  %s server --tun -l 0.0.0.0:8443 -k <key>\n", prog);
+    printf("  %s client -s 2.59.170.232:8443 -k <key>\n", prog);
+    printf("  %s client -s 2.59.170.232:8443 --app \"C:\\Program Files\\App\\app.exe\" -k <key>\n", prog);
 }
 
 int main(int argc, char **argv) {
@@ -149,7 +148,11 @@ int main(int argc, char **argv) {
         int server_port = 8443;
         char key[512] = "";
         char app_path[MAX_PATH] = "";
+#ifdef _WIN32
+        int tun_mode = 1;
+#else
         int tun_mode = 0;
+#endif
 
         for (int i = 2; i < argc; ++i) {
             if ((strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--server") == 0) && i + 1 < argc) {
@@ -163,6 +166,8 @@ int main(int argc, char **argv) {
                 tun_mode = 1;
             } else if (strcmp(argv[i], "--tun") == 0) {
                 tun_mode = 1;
+            } else if (strcmp(argv[i], "--port-forward") == 0) {
+                tun_mode = 0;
             } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
                 print_main_help(argv[0]);
                 net_cleanup();
