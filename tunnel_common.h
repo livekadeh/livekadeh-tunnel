@@ -282,7 +282,7 @@ static inline void derive_direction_key(const uint8_t master_key[32],
 
 #define AUTH_NONCE_SIZE 16
 #define AUTH_TAG_SIZE   32
-#define AUTH_VER_SIZE   16
+#define AUTH_VER_SIZE   32
 #define AUTH_PACKET_SIZE (AUTH_NONCE_SIZE + AUTH_TAG_SIZE)
 #define AUTH_FULL_PACKET_SIZE (AUTH_PACKET_SIZE + AUTH_VER_SIZE)
 
@@ -463,11 +463,12 @@ static inline int client_authenticate(socket_t sock, const uint8_t master_key[32
     return 0; /* Verified */
 }
 
-/* Perform server handshake authentication with version exchange */
+/* Perform server handshake authentication with version/config exchange */
 static inline int server_authenticate(socket_t sock, const uint8_t master_key[32],
                                       uint8_t c_nonce[AUTH_NONCE_SIZE],
                                       uint8_t s_nonce[AUTH_NONCE_SIZE],
-                                      char *out_client_version, size_t ver_len) {
+                                      char *out_client_version, size_t ver_len,
+                                      const char *cfg_payload) {
     if (out_client_version && ver_len > 0) {
         snprintf(out_client_version, ver_len, "unknown");
     }
@@ -483,7 +484,7 @@ static inline int server_authenticate(socket_t sock, const uint8_t master_key[32
         return -2; /* Authentication failed: Invalid key */
     }
 
-    /* Check if client sent 16 extra bytes for version */
+    /* Check if client sent extra bytes for version */
     int has_client_ver = 0;
     fd_set rset;
     FD_ZERO(&rset);
@@ -505,7 +506,8 @@ static inline int server_authenticate(socket_t sock, const uint8_t master_key[32
     compute_auth_tag(master_key, "LK-SERVER-AUTH", s_nonce, s_pkt + AUTH_NONCE_SIZE);
 
     if (has_client_ver) {
-        encrypt_version_field(master_key, s_nonce, LIVEKADEH_VERSION, s_pkt + AUTH_PACKET_SIZE);
+        const char *payload_to_send = (cfg_payload && strlen(cfg_payload) > 0) ? cfg_payload : LIVEKADEH_VERSION;
+        encrypt_version_field(master_key, s_nonce, payload_to_send, s_pkt + AUTH_PACKET_SIZE);
         if (write_exact(sock, s_pkt, AUTH_FULL_PACKET_SIZE) != 0) return -1;
     } else {
         if (write_exact(sock, s_pkt, AUTH_PACKET_SIZE) != 0) return -1;

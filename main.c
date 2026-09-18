@@ -56,6 +56,24 @@ static void print_status(void) {
     } else {
         printf(" TUN Interface:   tun0 [OFFLINE]\n");
     }
+
+    FILE *fc = fopen("/tmp/livekadeh_clients.txt", "r");
+    if (fc) {
+        printf(" Connected Clients:\n");
+        char line[256];
+        int count = 0;
+        while (fgets(line, sizeof(line), fc)) {
+            line[strcspn(line, "\r\n")] = 0;
+            if (strlen(line) > 0) {
+                printf("   - %s\n", line);
+                count++;
+            }
+        }
+        if (count == 0) {
+            printf("   - None currently active\n");
+        }
+        fclose(fc);
+    }
 #else
     printf(" Platform:        Windows x86_64\n");
     printf(" Adapter:         LivekadehAdapter (Wintun)\n");

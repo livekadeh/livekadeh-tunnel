@@ -47,13 +47,223 @@ static inline int recv_tun_packet(socket_t sock, lk_chacha20_ctx *ctx, uint8_t *
 #define UDP_MAGIC_REQ "LK-UDP-REQ"
 #define UDP_MAGIC_ACK "LK-UDP-ACK"
 #define UDP_REQ_LEN   (10 + 16 + 32)      /* 58 bytes: Magic(10) + Nonce(16) + Tag(32) */
-#define UDP_ACK_LEN   (10 + 16 + 32 + 16) /* 74 bytes: Magic(10) + Nonce(16) + Tag(32) + Ver(16) */
+#define UDP_ACK_LEN   (10 + 16 + 32 + 32) /* 90 bytes: Magic(10) + Nonce(16) + Tag(32) + Ver(32) */
 #define UDP_SALT_SIZE 4
 #define UDP_SEQ_SIZE  8
 #define UDP_HDR_SIZE  (UDP_SALT_SIZE + UDP_SEQ_SIZE) /* 12 bytes */
 #define UDP_PING_MAGIC 0xFFFFFFFD
 
 #ifndef _WIN32
+#define MAX_TUN_CLIENTS 256
+#define CLIENT_IP_START 2
+#define CLIENT_IP_END   254
+
+typedef enum {
+    CLIENT_TYPE_NONE = 0,
+    CLIENT_TYPE_TCP,
+    CLIENT_TYPE_UDP
+} client_type_t;
+
+typedef struct {
+    int active;
+    client_type_t type;
+    uint8_t ip_host;
+    time_t last_seen;
+    char client_version[32];
+    char remote_ip[64];
+    int remote_port;
+
+    /* Multi-TCP lanes */
+    int num_conns;
+    socket_t socks[NUM_TUNNEL_CONNS];
+    lk_chacha20_ctx ctx_tx[NUM_TUNNEL_CONNS];
+    lk_chacha20_ctx ctx_rx[NUM_TUNNEL_CONNS];
+    uint8_t c_nonce[AUTH_NONCE_SIZE];
+    uint8_t s_nonce[AUTH_NONCE_SIZE];
+
+    /* UDP datagram */
+    struct sockaddr_in udp_addr;
+    uint32_t udp_tx_salt;
+    uint64_t udp_tx_seq;
+} tun_client_session_t;
+
+static tun_client_session_t g_clients[MAX_TUN_CLIENTS];
+static pthread_mutex_t g_sessions_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_tun_write_lock = PTHREAD_MUTEX_INITIALIZER;
+static socket_t g_server_udp_sock = -1;
+static uint8_t g_server_master_key[32];
+
+static inline void update_clients_file(void) {
+    FILE *f = fopen("/tmp/livekadeh_clients.txt", "w");
+    if (!f) return;
+    pthread_mutex_lock(&g_sessions_lock);
+    for (int i = CLIENT_IP_START; i <= CLIENT_IP_END; i++) {
+        if (g_clients[i].active) {
+            if (g_clients[i].type == CLIENT_TYPE_TCP) {
+                fprintf(f, "10.10.10.%d [TCP %d-Lanes] %s:%d (v%s)\n",
+                        i, g_clients[i].num_conns, g_clients[i].remote_ip, g_clients[i].remote_port,
+                        g_clients[i].client_version);
+            } else if (g_clients[i].type == CLIENT_TYPE_UDP) {
+                fprintf(f, "10.10.10.%d [UDP] %s:%d\n",
+                        i, g_clients[i].remote_ip, g_clients[i].remote_port);
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_sessions_lock);
+    fclose(f);
+}
+
+static inline uint8_t alloc_client_ip(void) {
+    pthread_mutex_lock(&g_sessions_lock);
+    for (int i = CLIENT_IP_START; i <= CLIENT_IP_END; i++) {
+        if (!g_clients[i].active) {
+            memset(&g_clients[i], 0, sizeof(tun_client_session_t));
+            g_clients[i].active = 1;
+            g_clients[i].ip_host = (uint8_t)i;
+            g_clients[i].last_seen = time(NULL);
+            pthread_mutex_unlock(&g_sessions_lock);
+            return (uint8_t)i;
+        }
+    }
+    pthread_mutex_unlock(&g_sessions_lock);
+    return 0;
+}
+
+static inline void free_client_ip(uint8_t ip_host) {
+    if (ip_host < CLIENT_IP_START || ip_host > CLIENT_IP_END) return;
+    pthread_mutex_lock(&g_sessions_lock);
+    if (g_clients[ip_host].active) {
+        g_clients[ip_host].active = 0;
+    }
+    pthread_mutex_unlock(&g_sessions_lock);
+    update_clients_file();
+}
+
+/* Outbound Router: reads from tun_fd and routes packets by destination IP */
+static void *linux_tun_outbound_router_thread(void *arg) {
+    int tun_fd = (int)(intptr_t)arg;
+    uint8_t buf[MAX_PACKET_SIZE];
+
+    while (g_tunnel_running) {
+        ssize_t n = read(tun_fd, buf, sizeof(buf));
+        if (n <= 0) continue;
+        if (n < 20) continue;
+
+        if (buf[16] == 10 && buf[17] == 10 && buf[18] == 10) {
+            uint8_t dst_host = buf[19];
+            if (dst_host >= CLIENT_IP_START && dst_host <= CLIENT_IP_END) {
+                pthread_mutex_lock(&g_sessions_lock);
+                if (g_clients[dst_host].active) {
+                    if (g_clients[dst_host].type == CLIENT_TYPE_TCP) {
+                        int num_c = g_clients[dst_host].num_conns;
+                        if (num_c > 0) {
+                            int lane = (int)(flow_hash_packet(buf, (size_t)n) % (uint32_t)num_c);
+                            send_tun_packet(g_clients[dst_host].socks[lane], &g_clients[dst_host].ctx_tx[lane], buf, (uint16_t)n);
+                            g_traffic_tx_bytes += (uint64_t)n;
+                        }
+                    } else if (g_clients[dst_host].type == CLIENT_TYPE_UDP && IS_VALIDSOCK(g_server_udp_sock)) {
+                        uint64_t seq = ++g_clients[dst_host].udp_tx_seq;
+                        uint32_t salt = g_clients[dst_host].udp_tx_salt;
+                        uint8_t out[MAX_PACKET_SIZE + UDP_HDR_SIZE];
+                        memcpy(out, &salt, 4);
+                        memcpy(out + 4, &seq, 8);
+                        uint8_t nonce[12];
+                        memcpy(nonce, out, 12);
+                        lk_chacha20_crypt_packet(g_server_master_key, nonce, 0, buf, out + UDP_HDR_SIZE, (size_t)n);
+                        sendto(g_server_udp_sock, (const char *)out, (size_t)n + UDP_HDR_SIZE, 0,
+                               (struct sockaddr *)&g_clients[dst_host].udp_addr, sizeof(struct sockaddr_in));
+                        g_traffic_tx_bytes += (uint64_t)n;
+                    }
+                }
+                pthread_mutex_unlock(&g_sessions_lock);
+            }
+        }
+    }
+    return NULL;
+}
+
+/* Worker thread servicing inbound traffic from a connected TCP client */
+typedef struct {
+    int tun_fd;
+    uint8_t ip_host;
+} tcp_worker_param_t;
+
+static void *linux_tcp_client_worker(void *arg) {
+    tcp_worker_param_t *p = (tcp_worker_param_t *)arg;
+    int tun_fd = p->tun_fd;
+    uint8_t ip_host = p->ip_host;
+    free(p);
+
+    uint8_t buf[MAX_PACKET_SIZE];
+
+    while (g_tunnel_running) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        int max_fd = 0;
+        int num_c = 0;
+        socket_t socks[NUM_TUNNEL_CONNS];
+
+        pthread_mutex_lock(&g_sessions_lock);
+        if (!g_clients[ip_host].active) {
+            pthread_mutex_unlock(&g_sessions_lock);
+            break;
+        }
+        num_c = g_clients[ip_host].num_conns;
+        for (int i = 0; i < num_c; i++) {
+            socks[i] = g_clients[ip_host].socks[i];
+            FD_SET(socks[i], &rfds);
+            if ((int)socks[i] > max_fd) max_fd = (int)socks[i];
+        }
+        pthread_mutex_unlock(&g_sessions_lock);
+
+        struct timeval tv = { 1, 0 };
+        int act = select(max_fd + 1, &rfds, NULL, NULL, &tv);
+        if (act < 0) break;
+        if (act == 0) continue;
+
+        int drop = 0;
+        for (int i = 0; i < num_c; i++) {
+            if (FD_ISSET(socks[i], &rfds)) {
+                uint16_t plen = 0;
+                pthread_mutex_lock(&g_sessions_lock);
+                lk_chacha20_ctx *p_ctx = &g_clients[ip_host].ctx_rx[i];
+                int r = recv_tun_packet(socks[i], p_ctx, buf, &plen);
+                pthread_mutex_unlock(&g_sessions_lock);
+                if (r != 0) {
+                    drop = 1;
+                    break;
+                }
+                pthread_mutex_lock(&g_tun_write_lock);
+                if (write(tun_fd, buf, plen) > 0) {
+                    g_traffic_rx_bytes += plen;
+                }
+                pthread_mutex_unlock(&g_tun_write_lock);
+
+                pthread_mutex_lock(&g_sessions_lock);
+                if (g_clients[ip_host].active) {
+                    g_clients[ip_host].last_seen = time(NULL);
+                }
+                pthread_mutex_unlock(&g_sessions_lock);
+            }
+        }
+        if (drop) break;
+    }
+
+    pthread_mutex_lock(&g_sessions_lock);
+    if (g_clients[ip_host].active) {
+        printf("[Livekadeh VPN Server] TCP Client 10.10.10.%d disconnected from %s:%d\n",
+               ip_host, g_clients[ip_host].remote_ip, g_clients[ip_host].remote_port);
+        for (int i = 0; i < g_clients[ip_host].num_conns; i++) {
+            CLOSE_SOCK(g_clients[ip_host].socks[i]);
+        }
+        g_clients[ip_host].active = 0;
+    }
+    pthread_mutex_unlock(&g_sessions_lock);
+    update_clients_file();
+
+    return NULL;
+}
+
 typedef struct {
     int tun_fd;
     socket_t udp_sock;
@@ -68,94 +278,135 @@ static void *linux_tun_udp_server_thread(void *arg) {
     memcpy(master_key, a->master_key, 32);
     free(a);
 
-    struct sockaddr_in client_addr;
-    socklen_t addr_len = sizeof(client_addr);
-    memset(&client_addr, 0, sizeof(client_addr));
-    int client_active = 0;
-
-    uint32_t tx_salt = 0;
-    lk_random_bytes((uint8_t *)&tx_salt, sizeof(tx_salt));
-    uint64_t tx_seq = 0;
-
     uint8_t buf[MAX_PACKET_SIZE + UDP_HDR_SIZE];
 
     while (g_tunnel_running) {
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(s, &rfds);
-        if (client_active) {
-            FD_SET(tun_fd, &rfds);
-        }
-        int max_fd = (int)s;
-        if (client_active && tun_fd > max_fd) max_fd = tun_fd;
 
         struct timeval tv = { 0, 50000 }; /* 50ms */
-        int sel = select(max_fd + 1, &rfds, NULL, NULL, &tv);
+        int sel = select((int)s + 1, &rfds, NULL, NULL, &tv);
+
+        /* Periodically clean up timed-out UDP clients (60s inactivity) */
+        static time_t last_reap = 0;
+        time_t now = time(NULL);
+        if (now - last_reap >= 5) {
+            last_reap = now;
+            pthread_mutex_lock(&g_sessions_lock);
+            int changed = 0;
+            for (int i = CLIENT_IP_START; i <= CLIENT_IP_END; i++) {
+                if (g_clients[i].active && g_clients[i].type == CLIENT_TYPE_UDP) {
+                    if (now - g_clients[i].last_seen > 60) {
+                        printf("[Livekadeh VPN Server] UDP Client 10.10.10.%d timed out (idle > 60s).\n", i);
+                        g_clients[i].active = 0;
+                        changed = 1;
+                    }
+                }
+            }
+            pthread_mutex_unlock(&g_sessions_lock);
+            if (changed) update_clients_file();
+        }
+
         if (sel <= 0) continue;
 
         if (FD_ISSET(s, &rfds)) {
             struct sockaddr_in from;
             socklen_t from_len = sizeof(from);
             int n = recvfrom(s, (char *)buf, sizeof(buf), 0, (struct sockaddr *)&from, &from_len);
-            if (n > 0) {
-                if (n == UDP_REQ_LEN && memcmp(buf, UDP_MAGIC_REQ, 10) == 0) {
-                    uint8_t *c_nonce = buf + 10;
-                    uint8_t *tag = buf + 26;
-                    uint8_t exp_tag[32];
-                    compute_auth_tag(master_key, "LK-UDP-AUTH", c_nonce, exp_tag);
-                    if (memcmp(tag, exp_tag, 32) == 0) {
-                        uint8_t ack[UDP_ACK_LEN];
-                        memcpy(ack, UDP_MAGIC_ACK, 10);
-                        uint8_t s_nonce[16];
-                        lk_random_bytes(s_nonce, 16);
-                        memcpy(ack + 10, s_nonce, 16);
-                        compute_auth_tag(master_key, "LK-UDP-ACK", s_nonce, ack + 26);
-                        memset(ack + 58, 0, 16);
-                        strncpy((char *)(ack + 58), LIVEKADEH_VERSION, 15);
+            if (n <= 0) continue;
 
-                        sendto(s, (const char *)ack, UDP_ACK_LEN, 0, (struct sockaddr *)&from, from_len);
-                        memcpy(&client_addr, &from, sizeof(from));
-                        addr_len = from_len;
-                        client_active = 1;
-                        printf("[Livekadeh VPN Server] UDP Client Authenticated: %s:%d\n",
-                               inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+            if (n == UDP_REQ_LEN && memcmp(buf, UDP_MAGIC_REQ, 10) == 0) {
+                uint8_t *c_nonce = buf + 10;
+                uint8_t *tag = buf + 26;
+                uint8_t exp_tag[32];
+                compute_auth_tag(master_key, "LK-UDP-AUTH", c_nonce, exp_tag);
+                if (memcmp(tag, exp_tag, 32) == 0) {
+                    uint8_t ip_host = 0;
+                    pthread_mutex_lock(&g_sessions_lock);
+                    for (int i = CLIENT_IP_START; i <= CLIENT_IP_END; i++) {
+                        if (g_clients[i].active && g_clients[i].type == CLIENT_TYPE_UDP &&
+                            g_clients[i].udp_addr.sin_addr.s_addr == from.sin_addr.s_addr &&
+                            g_clients[i].udp_addr.sin_port == from.sin_port) {
+                            ip_host = (uint8_t)i;
+                            break;
+                        }
                     }
-                } else if (client_active && n >= (int)UDP_HDR_SIZE) {
-                    if (from.sin_addr.s_addr == client_addr.sin_addr.s_addr) {
-                        client_addr.sin_port = from.sin_port;
-                        uint8_t nonce[12];
-                        memcpy(nonce, buf, 12);
-                        size_t cipher_len = (size_t)(n - UDP_HDR_SIZE);
-                        if (cipher_len > 0) {
-                            uint8_t plain[MAX_PACKET_SIZE];
-                            lk_chacha20_crypt_packet(master_key, nonce, 0, buf + UDP_HDR_SIZE, plain, cipher_len);
-                            if (cipher_len == 4 && *(uint32_t *)plain == UDP_PING_MAGIC) {
-                                /* Keepalive received */
-                            } else {
-                                if (write(tun_fd, plain, cipher_len) > 0) {
-                                    g_traffic_rx_bytes += cipher_len;
+                    pthread_mutex_unlock(&g_sessions_lock);
+
+                    if (ip_host == 0) {
+                        ip_host = alloc_client_ip();
+                    }
+
+                    if (ip_host == 0) {
+                        continue;
+                    }
+
+                    pthread_mutex_lock(&g_sessions_lock);
+                    g_clients[ip_host].active = 1;
+                    g_clients[ip_host].type = CLIENT_TYPE_UDP;
+                    g_clients[ip_host].ip_host = ip_host;
+                    g_clients[ip_host].last_seen = time(NULL);
+                    memcpy(&g_clients[ip_host].udp_addr, &from, sizeof(from));
+                    lk_random_bytes((uint8_t *)&g_clients[ip_host].udp_tx_salt, 4);
+                    g_clients[ip_host].udp_tx_seq = 0;
+                    snprintf(g_clients[ip_host].remote_ip, sizeof(g_clients[ip_host].remote_ip), "%s", inet_ntoa(from.sin_addr));
+                    g_clients[ip_host].remote_port = ntohs(from.sin_port);
+                    pthread_mutex_unlock(&g_sessions_lock);
+
+                    update_clients_file();
+
+                    uint8_t ack[UDP_ACK_LEN];
+                    memcpy(ack, UDP_MAGIC_ACK, 10);
+                    uint8_t s_nonce[16];
+                    lk_random_bytes(s_nonce, 16);
+                    memcpy(ack + 10, s_nonce, 16);
+                    compute_auth_tag(master_key, "LK-UDP-ACK", s_nonce, ack + 26);
+                    memset(ack + 58, 0, 32);
+                    snprintf((char *)(ack + 58), 32, "%s@10.10.10.%d", LIVEKADEH_VERSION, ip_host);
+
+                    sendto(s, (const char *)ack, UDP_ACK_LEN, 0, (struct sockaddr *)&from, from_len);
+                    printf("[Livekadeh VPN Server] UDP Client Authenticated: %s:%d -> Assigned IP: 10.10.10.%d\n",
+                           inet_ntoa(from.sin_addr), ntohs(from.sin_port), ip_host);
+                }
+            } else if (n >= (int)UDP_HDR_SIZE) {
+                uint8_t nonce[12];
+                memcpy(nonce, buf, 12);
+                size_t cipher_len = (size_t)(n - UDP_HDR_SIZE);
+                if (cipher_len > 0 && cipher_len <= MAX_PACKET_SIZE) {
+                    uint8_t plain[MAX_PACKET_SIZE];
+                    lk_chacha20_crypt_packet(master_key, nonce, 0, buf + UDP_HDR_SIZE, plain, cipher_len);
+                    if (cipher_len == 4 && *(uint32_t *)plain == UDP_PING_MAGIC) {
+                        pthread_mutex_lock(&g_sessions_lock);
+                        for (int i = CLIENT_IP_START; i <= CLIENT_IP_END; i++) {
+                            if (g_clients[i].active && g_clients[i].type == CLIENT_TYPE_UDP) {
+                                if (g_clients[i].udp_addr.sin_addr.s_addr == from.sin_addr.s_addr) {
+                                    g_clients[i].udp_addr.sin_port = from.sin_port;
+                                    g_clients[i].last_seen = time(NULL);
+                                    break;
                                 }
                             }
                         }
+                        pthread_mutex_unlock(&g_sessions_lock);
+                    } else if (cipher_len >= 20) {
+                        if (plain[12] == 10 && plain[13] == 10 && plain[14] == 10) {
+                            uint8_t src_host = plain[15];
+                            if (src_host >= CLIENT_IP_START && src_host <= CLIENT_IP_END) {
+                                pthread_mutex_lock(&g_sessions_lock);
+                                if (g_clients[src_host].active && g_clients[src_host].type == CLIENT_TYPE_UDP) {
+                                    memcpy(&g_clients[src_host].udp_addr, &from, sizeof(from));
+                                    g_clients[src_host].last_seen = time(NULL);
+                                }
+                                pthread_mutex_unlock(&g_sessions_lock);
+                            }
+                        }
+                        pthread_mutex_lock(&g_tun_write_lock);
+                        if (write(tun_fd, plain, cipher_len) > 0) {
+                            g_traffic_rx_bytes += cipher_len;
+                        }
+                        pthread_mutex_unlock(&g_tun_write_lock);
                     }
                 }
-            }
-        }
-
-        if (client_active && FD_ISSET(tun_fd, &rfds)) {
-            uint8_t pkt[MAX_PACKET_SIZE];
-            int r = read(tun_fd, pkt, sizeof(pkt));
-            if (r > 0) {
-                uint8_t out[MAX_PACKET_SIZE + UDP_HDR_SIZE];
-                uint8_t nonce[12];
-                uint64_t seq = ++tx_seq;
-                memcpy(out, &tx_salt, 4);
-                memcpy(out + 4, &seq, 8);
-                memcpy(nonce, out, 12);
-
-                lk_chacha20_crypt_packet(master_key, nonce, 0, pkt, out + UDP_HDR_SIZE, (size_t)r);
-                sendto(s, (const char *)out, (size_t)r + UDP_HDR_SIZE, 0, (struct sockaddr *)&client_addr, addr_len);
-                g_traffic_tx_bytes += (uint64_t)r;
             }
         }
     }
@@ -242,15 +493,15 @@ static inline int run_linux_tun_server(int listen_port, const char *key) {
         fclose(fk);
     }
 
-    uint8_t master_key[32];
-    derive_master_key(key, master_key);
+    derive_master_key(key, g_server_master_key);
 
     socket_t udp_sock = create_udp_listener("0.0.0.0", listen_port);
     if (IS_VALIDSOCK(udp_sock)) {
+        g_server_udp_sock = udp_sock;
         linux_udp_args_t *uargs = (linux_udp_args_t *)malloc(sizeof(linux_udp_args_t));
         uargs->tun_fd = tun_fd;
         uargs->udp_sock = udp_sock;
-        memcpy(uargs->master_key, master_key, 32);
+        memcpy(uargs->master_key, g_server_master_key, 32);
         pthread_t udp_tid;
         if (pthread_create(&udp_tid, NULL, linux_tun_udp_server_thread, uargs) == 0) {
             pthread_detach(udp_tid);
@@ -260,12 +511,21 @@ static inline int run_linux_tun_server(int listen_port, const char *key) {
         }
     }
 
+    /* Start Outbound Router Thread */
+    pthread_t router_tid;
+    if (pthread_create(&router_tid, NULL, linux_tun_outbound_router_thread, (void *)(intptr_t)tun_fd) == 0) {
+        pthread_detach(router_tid);
+    }
+
+    unlink("/tmp/livekadeh_clients.txt");
+
     printf("\n==================================================================\n");
     printf("       Livekadeh Tunnel Server (v%s)\n", LIVEKADEH_VERSION);
     printf("==================================================================\n");
-    printf(" [TUN] Device:        %s (10.10.10.1 <-> 10.10.10.2)\n", dev);
+    printf(" [TUN] Device:        %s (Subnet: 10.10.10.0/24)\n", dev);
     printf(" [NET] Dual-Stack:    TCP :%d & UDP :%d\n", listen_port, listen_port);
     printf(" [SEC] Server Key:    %s\n", key);
+    printf(" [POOL] Capacity:     253 Concurrent Clients (10.10.10.2 - 10.10.10.254)\n");
     printf("==================================================================\n\n");
 
     while (g_tunnel_running) {
@@ -276,147 +536,159 @@ static inline int run_linux_tun_server(int listen_port, const char *key) {
 
         set_tcp_nodelay(sock);
 
-        /* Set 3-second receive timeout for handshake authentication */
         struct timeval tv_auth = { 3, 0 };
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv_auth, sizeof(tv_auth));
 
-        uint8_t c_nonce[AUTH_NONCE_SIZE];
-        uint8_t s_nonce[AUTH_NONCE_SIZE];
-        char client_version[64] = "unknown";
-
-        int auth_res = server_authenticate(sock, master_key, c_nonce, s_nonce, client_version, sizeof(client_version));
-        if (auth_res != 0) {
-            printf("[Livekadeh VPN Server] Unauthorized probe or invalid key from %s (Rejected)\n",
-                   inet_ntoa(client_addr.sin_addr));
+        uint8_t init_pkt[AUTH_FULL_PACKET_SIZE];
+        if (read_exact(sock, init_pkt, AUTH_PACKET_SIZE) != 0) {
             CLOSE_SOCK(sock);
             continue;
         }
 
-        /* Reset receive timeout to 0 (normal blocking operation) and tune socket */
-        struct timeval tv_zero = { 0, 0 };
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv_zero, sizeof(tv_zero));
-        tune_tunnel_socket(sock);
+        uint8_t expected_c_tag[AUTH_TAG_SIZE];
+        compute_auth_tag(g_server_master_key, "LK-CLIENT-AUTH", init_pkt, expected_c_tag);
 
-        socket_t client_socks[NUM_TUNNEL_CONNS];
-        client_socks[0] = sock;
-        int num_conns = 1;
-
-        /* Accept auxiliary connection lanes (up to NUM_TUNNEL_CONNS) within a 1-second window */
-        while (num_conns < NUM_TUNNEL_CONNS) {
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(listen_sock, &rfds);
-            struct timeval tv = { 0, 400000 }; /* 400ms per check */
-            int r = select((int)listen_sock + 1, &rfds, NULL, NULL, &tv);
-            if (r <= 0) break;
-
-            struct sockaddr_in aux_addr;
-            socklen_t aux_len = sizeof(aux_addr);
-            socket_t aux_sock = accept(listen_sock, (struct sockaddr *)&aux_addr, &aux_len);
-            if (!IS_VALIDSOCK(aux_sock)) break;
-
-            struct timeval to = { 1, 0 };
-            setsockopt(aux_sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
-
-            uint8_t attach_buf[ATTACH_PACKET_SIZE];
-            if (read_exact(aux_sock, attach_buf, ATTACH_PACKET_SIZE) != 0) {
-                CLOSE_SOCK(aux_sock);
-                continue;
-            }
-
-            uint8_t req_c_nonce[AUTH_NONCE_SIZE];
-            uint8_t lane_idx = 0;
-            if (verify_attach_packet(master_key, attach_buf, req_c_nonce, &lane_idx) != 0 ||
-                memcmp(req_c_nonce, c_nonce, AUTH_NONCE_SIZE) != 0 ||
-                lane_idx != (uint8_t)num_conns) {
-                CLOSE_SOCK(aux_sock);
-                continue;
-            }
-
-            /* Send attach ACK */
-            uint8_t ack_pkt[ATTACH_PACKET_SIZE];
-            memset(ack_pkt, 0, sizeof(ack_pkt));
-            memcpy(ack_pkt, s_nonce, AUTH_NONCE_SIZE);
-            ack_pkt[AUTH_NONCE_SIZE] = lane_idx;
-            compute_auth_tag(master_key, "LK-ATTACH-OK", ack_pkt, ack_pkt + AUTH_NONCE_SIZE + 16);
-            if (write_exact(aux_sock, ack_pkt, ATTACH_PACKET_SIZE) != 0) {
-                CLOSE_SOCK(aux_sock);
-                continue;
-            }
-
-            setsockopt(aux_sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv_zero, sizeof(tv_zero));
-            tune_tunnel_socket(aux_sock);
-
-            client_socks[num_conns++] = aux_sock;
-        }
-
-        uint8_t key_c2s[32], key_s2c[32];
-        derive_direction_key(master_key, "C2S", c_nonce, key_c2s);
-        derive_direction_key(master_key, "S2C", s_nonce, key_s2c);
-
-        lk_chacha20_ctx ctx_rx[NUM_TUNNEL_CONNS], ctx_tx[NUM_TUNNEL_CONNS];
-        for (int i = 0; i < num_conns; i++) {
-            uint8_t lane_c_nonce[16], lane_s_nonce[16];
-            memcpy(lane_c_nonce, c_nonce, 16);
-            memcpy(lane_s_nonce, s_nonce, 16);
-            lane_c_nonce[15] ^= (uint8_t)i;
-            lane_s_nonce[15] ^= (uint8_t)i;
-
-            lk_chacha20_init(&ctx_rx[i], key_c2s, lane_c_nonce, 1);
-            lk_chacha20_init(&ctx_tx[i], key_s2c, lane_s_nonce, 1);
-        }
-
-        printf("[Livekadeh VPN Server] Client (v%s) authenticated from %s! Multi-TCP active with %d lanes.\n",
-               client_version, inet_ntoa(client_addr.sin_addr), num_conns);
-
-        uint8_t buf[MAX_PACKET_SIZE];
-
-        while (g_tunnel_running) {
-            fd_set read_fds;
-            FD_ZERO(&read_fds);
-            FD_SET(tun_fd, &read_fds);
-            int max_fd = (int)tun_fd;
-
-            for (int i = 0; i < num_conns; i++) {
-                FD_SET(client_socks[i], &read_fds);
-                if ((int)client_socks[i] > max_fd) max_fd = (int)client_socks[i];
-            }
-
-            int act = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
-            if (act <= 0) break;
-
-            /* Inbound: Sockets -> TUN */
-            int client_alive = 1;
-            for (int i = 0; i < num_conns; i++) {
-                if (FD_ISSET(client_socks[i], &read_fds)) {
-                    uint16_t plen = 0;
-                    if (recv_tun_packet(client_socks[i], &ctx_rx[i], buf, &plen) != 0) {
-                        client_alive = 0;
-                        break;
-                    }
-                    if (write(tun_fd, buf, plen) != (ssize_t)plen) {
-                        client_alive = 0;
-                        break;
-                    }
-                    g_traffic_rx_bytes += plen;
+        if (memcmp(init_pkt + AUTH_NONCE_SIZE, expected_c_tag, AUTH_TAG_SIZE) == 0) {
+            char client_version[64] = "unknown";
+            fd_set rset;
+            FD_ZERO(&rset);
+            FD_SET(sock, &rset);
+            struct timeval tv = { 0, 50000 };
+            if (select((int)sock + 1, &rset, NULL, NULL, &tv) > 0) {
+                if (read_exact(sock, init_pkt + AUTH_PACKET_SIZE, AUTH_VER_SIZE) == 0) {
+                    decrypt_version_field(g_server_master_key, init_pkt, init_pkt + AUTH_PACKET_SIZE, client_version, sizeof(client_version));
                 }
             }
-            if (!client_alive) break;
 
-            /* Outbound: TUN -> Sockets (5-Tuple Flow Hashed) */
-            if (FD_ISSET(tun_fd, &read_fds)) {
-                ssize_t n = read(tun_fd, buf, sizeof(buf));
-                if (n <= 0) break;
-                int lane = (int)(flow_hash_packet(buf, (size_t)n) % (uint32_t)num_conns);
-                if (send_tun_packet(client_socks[lane], &ctx_tx[lane], buf, (uint16_t)n) != 0) break;
-                g_traffic_tx_bytes += (uint64_t)n;
+            uint8_t ip_host = alloc_client_ip();
+            if (ip_host == 0) {
+                printf("[Livekadeh VPN Server] Rejected connection from %s: IP pool full!\n",
+                       inet_ntoa(client_addr.sin_addr));
+                CLOSE_SOCK(sock);
+                continue;
+            }
+
+            uint8_t c_nonce[AUTH_NONCE_SIZE];
+            memcpy(c_nonce, init_pkt, AUTH_NONCE_SIZE);
+
+            uint8_t s_nonce[AUTH_NONCE_SIZE];
+            if (lk_random_bytes(s_nonce, AUTH_NONCE_SIZE) != 0) {
+                free_client_ip(ip_host);
+                CLOSE_SOCK(sock);
+                continue;
+            }
+
+            char cfg_payload[32];
+            snprintf(cfg_payload, sizeof(cfg_payload), "%s@10.10.10.%d", LIVEKADEH_VERSION, ip_host);
+
+            uint8_t s_pkt[AUTH_FULL_PACKET_SIZE];
+            memcpy(s_pkt, s_nonce, AUTH_NONCE_SIZE);
+            compute_auth_tag(g_server_master_key, "LK-SERVER-AUTH", s_nonce, s_pkt + AUTH_NONCE_SIZE);
+            encrypt_version_field(g_server_master_key, s_nonce, cfg_payload, s_pkt + AUTH_PACKET_SIZE);
+
+            if (write_exact(sock, s_pkt, AUTH_FULL_PACKET_SIZE) != 0) {
+                free_client_ip(ip_host);
+                CLOSE_SOCK(sock);
+                continue;
+            }
+
+            struct timeval tv_zero = { 0, 0 };
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv_zero, sizeof(tv_zero));
+            tune_tunnel_socket(sock);
+
+            uint8_t key_c2s[32], key_s2c[32];
+            derive_direction_key(g_server_master_key, "C2S", c_nonce, key_c2s);
+            derive_direction_key(g_server_master_key, "S2C", s_nonce, key_s2c);
+
+            pthread_mutex_lock(&g_sessions_lock);
+            g_clients[ip_host].active = 1;
+            g_clients[ip_host].type = CLIENT_TYPE_TCP;
+            g_clients[ip_host].ip_host = ip_host;
+            g_clients[ip_host].num_conns = 1;
+            g_clients[ip_host].socks[0] = sock;
+            memcpy(g_clients[ip_host].c_nonce, c_nonce, AUTH_NONCE_SIZE);
+            memcpy(g_clients[ip_host].s_nonce, s_nonce, AUTH_NONCE_SIZE);
+
+            for (int i = 0; i < NUM_TUNNEL_CONNS; i++) {
+                uint8_t lane_c_nonce[16], lane_s_nonce[16];
+                memcpy(lane_c_nonce, c_nonce, 16);
+                memcpy(lane_s_nonce, s_nonce, 16);
+                lane_c_nonce[15] ^= (uint8_t)i;
+                lane_s_nonce[15] ^= (uint8_t)i;
+
+                lk_chacha20_init(&g_clients[ip_host].ctx_rx[i], key_c2s, lane_c_nonce, 1);
+                lk_chacha20_init(&g_clients[ip_host].ctx_tx[i], key_s2c, lane_s_nonce, 1);
+            }
+
+            snprintf(g_clients[ip_host].client_version, sizeof(g_clients[ip_host].client_version), "%s", client_version);
+            snprintf(g_clients[ip_host].remote_ip, sizeof(g_clients[ip_host].remote_ip), "%s", inet_ntoa(client_addr.sin_addr));
+            g_clients[ip_host].remote_port = ntohs(client_addr.sin_port);
+            g_clients[ip_host].last_seen = time(NULL);
+            pthread_mutex_unlock(&g_sessions_lock);
+
+            update_clients_file();
+
+            printf("[Livekadeh VPN Server] TCP Client (v%s) authenticated from %s:%d! Assigned IP: 10.10.10.%d\n",
+                   client_version, inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port), ip_host);
+
+            tcp_worker_param_t *wp = (tcp_worker_param_t *)malloc(sizeof(tcp_worker_param_t));
+            wp->tun_fd = tun_fd;
+            wp->ip_host = ip_host;
+            pthread_t c_tid;
+            if (pthread_create(&c_tid, NULL, linux_tcp_client_worker, wp) == 0) {
+                pthread_detach(c_tid);
+            } else {
+                free(wp);
+                free_client_ip(ip_host);
+                CLOSE_SOCK(sock);
+            }
+            continue;
+        }
+
+        /* Check for auxiliary multi-TCP lane attachment */
+        if (read_exact(sock, init_pkt + AUTH_PACKET_SIZE, 16) == 0) {
+            uint8_t req_c_nonce[AUTH_NONCE_SIZE];
+            uint8_t lane_idx = 0;
+            if (verify_attach_packet(g_server_master_key, init_pkt, req_c_nonce, &lane_idx) == 0 &&
+                lane_idx > 0 && lane_idx < NUM_TUNNEL_CONNS) {
+                pthread_mutex_lock(&g_sessions_lock);
+                int found_host = -1;
+                for (int h = CLIENT_IP_START; h <= CLIENT_IP_END; h++) {
+                    if (g_clients[h].active && g_clients[h].type == CLIENT_TYPE_TCP &&
+                        memcmp(g_clients[h].c_nonce, req_c_nonce, AUTH_NONCE_SIZE) == 0) {
+                        found_host = h;
+                        break;
+                    }
+                }
+                if (found_host != -1) {
+                    uint8_t ack_pkt[ATTACH_PACKET_SIZE];
+                    memset(ack_pkt, 0, sizeof(ack_pkt));
+                    memcpy(ack_pkt, g_clients[found_host].s_nonce, AUTH_NONCE_SIZE);
+                    ack_pkt[AUTH_NONCE_SIZE] = lane_idx;
+                    compute_auth_tag(g_server_master_key, "LK-ATTACH-OK", ack_pkt, ack_pkt + AUTH_NONCE_SIZE + 16);
+                    write_exact(sock, ack_pkt, ATTACH_PACKET_SIZE);
+
+                    struct timeval tv_zero = { 0, 0 };
+                    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv_zero, sizeof(tv_zero));
+                    tune_tunnel_socket(sock);
+
+                    g_clients[found_host].socks[lane_idx] = sock;
+                    if (lane_idx + 1 > g_clients[found_host].num_conns) {
+                        g_clients[found_host].num_conns = lane_idx + 1;
+                    }
+                    printf("[Livekadeh VPN Server] TCP Client 10.10.10.%d: Attached Lane %d (Total Lanes: %d)\n",
+                           found_host, lane_idx, g_clients[found_host].num_conns);
+                    pthread_mutex_unlock(&g_sessions_lock);
+                    update_clients_file();
+                    continue;
+                }
+                pthread_mutex_unlock(&g_sessions_lock);
             }
         }
 
-        printf("[Livekadeh VPN Server] Client disconnected.\n");
-        for (int i = 0; i < num_conns; i++) {
-            CLOSE_SOCK(client_socks[i]);
-        }
+        printf("[Livekadeh VPN Server] Unauthorized probe or invalid packet from %s (Rejected)\n",
+               inet_ntoa(client_addr.sin_addr));
+        CLOSE_SOCK(sock);
     }
 
     if (IS_VALIDSOCK(udp_sock)) CLOSE_SOCK(udp_sock);
@@ -479,7 +751,14 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
         return 1;
     }
 
-    log_append(1 /* INFO */, "Connected to Livekadeh Tunnel Server v%s! Authentication verified.", server_version);
+    char assigned_ip[64] = "10.10.10.2";
+    char *at = strchr(server_version, '@');
+    if (at) {
+        *at = '\0';
+        snprintf(assigned_ip, sizeof(assigned_ip), "%s", at + 1);
+    }
+
+    log_append(1 /* INFO */, "Connected to Livekadeh Tunnel Server v%s! Assigned IP: %s", server_version, assigned_ip);
 
     /* Step 2.5: Establish Multi-TCP connection pool (if requested) */
     tune_tunnel_socket(sock);
@@ -556,9 +835,9 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
         }
     }
 
-    /* Configure IP 10.10.10.2 and default internet routes through Wintun */
-    log_append(1 /* INFO */, "Configuring adapter IP 10.10.10.2 and routing traffic through tunnel...");
-    wintun_configure_ip("LivekadehAdapter", "10.10.10.2", "255.255.255.0", p->server_host);
+    /* Configure assigned IP and default internet routes through Wintun */
+    log_append(1 /* INFO */, "Configuring adapter IP %s and routing traffic through tunnel...", assigned_ip);
+    wintun_configure_ip("LivekadehAdapter", assigned_ip, "255.255.255.0", p->server_host);
 
     /* Setup WFP Per-App if requested */
     if (p->is_per_app && p->num_apps > 0) {
@@ -566,7 +845,7 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
         for (int i = 0; i < p->num_apps; i++) {
             log_append(0 /* DEBUG */, "  -> App: %s", p->app_paths[i]);
         }
-        wfp_setup_per_apps((const char (*)[MAX_PATH])p->app_paths, p->num_apps, "10.10.10.2");
+        wfp_setup_per_apps((const char (*)[MAX_PATH])p->app_paths, p->num_apps, assigned_ip);
     }
 
     WINTUN_SESSION_HANDLE session = pWintunStartSession(adapter, 0x400000);
@@ -744,7 +1023,8 @@ static DWORD WINAPI win_tun_udp_client_thread(LPVOID arg) {
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
 
     int ack_received = 0;
-    char server_version[32] = "unknown";
+    char server_version[64] = "unknown";
+    char assigned_ip[64] = "10.10.10.2";
 
     for (int attempt = 1; attempt <= 4; attempt++) {
         sendto(s, (const char *)req, UDP_REQ_LEN, 0, (struct sockaddr *)&srv_addr, sizeof(srv_addr));
@@ -760,6 +1040,11 @@ static DWORD WINAPI win_tun_udp_client_thread(LPVOID arg) {
             compute_auth_tag(master_key, "LK-UDP-ACK", s_nonce, exp_tag);
             if (memcmp(tag, exp_tag, 32) == 0) {
                 snprintf(server_version, sizeof(server_version), "%s", (char *)(ack + 58));
+                char *at = strchr(server_version, '@');
+                if (at) {
+                    *at = '\0';
+                    snprintf(assigned_ip, sizeof(assigned_ip), "%s", at + 1);
+                }
                 ack_received = 1;
                 break;
             } else {
@@ -779,7 +1064,7 @@ static DWORD WINAPI win_tun_udp_client_thread(LPVOID arg) {
         return 1;
     }
 
-    log_append(1 /* INFO */, "Connected to Livekadeh Tunnel Server (UDP Mode) v%s! Authentication verified.", server_version);
+    log_append(1 /* INFO */, "Connected to Livekadeh Tunnel Server (UDP Mode v%s)! Assigned IP: %s", server_version, assigned_ip);
 
     DWORD to_zero = 0;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to_zero, sizeof(to_zero));
@@ -802,9 +1087,9 @@ static DWORD WINAPI win_tun_udp_client_thread(LPVOID arg) {
         }
     }
 
-    /* Configure IP 10.10.10.2 and default internet routes through Wintun */
-    log_append(1 /* INFO */, "Configuring adapter IP 10.10.10.2 and routing traffic through tunnel...");
-    wintun_configure_ip("LivekadehAdapter", "10.10.10.2", "255.255.255.0", p->server_host);
+    /* Configure assigned IP and default internet routes through Wintun */
+    log_append(1 /* INFO */, "Configuring adapter IP %s and routing traffic through tunnel...", assigned_ip);
+    wintun_configure_ip("LivekadehAdapter", assigned_ip, "255.255.255.0", p->server_host);
 
     /* Setup WFP Per-App if requested */
     if (p->is_per_app && p->num_apps > 0) {
@@ -812,7 +1097,7 @@ static DWORD WINAPI win_tun_udp_client_thread(LPVOID arg) {
         for (int i = 0; i < p->num_apps; i++) {
             log_append(0 /* DEBUG */, "  -> App: %s", p->app_paths[i]);
         }
-        wfp_setup_per_apps((const char (*)[MAX_PATH])p->app_paths, p->num_apps, "10.10.10.2");
+        wfp_setup_per_apps((const char (*)[MAX_PATH])p->app_paths, p->num_apps, assigned_ip);
     }
 
     WINTUN_SESSION_HANDLE session = pWintunStartSession(adapter, 0x400000);

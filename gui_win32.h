@@ -255,6 +255,8 @@ static DWORD WINAPI test_connection_thread(LPVOID arg) {
 
         DWORD total_time = GetTickCount() - start;
         if (auth == 0) {
+            char *at = strchr(server_ver, '@');
+            if (at) *at = '\0';
             log_append(LOG_LEVEL_INFO, "[Server Probe] SUCCESS: Connected to Livekadeh Tunnel Server v%s! (RTT: %lu ms)", server_ver, total_time);
             log_append(LOG_LEVEL_INFO, "[Server Probe] Encryption key verified. Click 'Connect Tunnel' to start virtual adapter.");
         } else if (auth == -2) {

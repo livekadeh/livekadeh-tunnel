@@ -41,16 +41,17 @@ static inline int tun_alloc_linux(char *dev, size_t dev_len) {
     return fd;
 }
 
-/* Configure IP address and enable kernel NAT masquerade */
+/* Configure IP subnet and enable kernel NAT masquerade */
 static inline int tun_configure_linux(const char *dev, const char *server_ip, const char *client_ip) {
+    (void)client_ip;
     char cmd[512];
 
-    /* Assign IP and point-to-point peer IP */
-    snprintf(cmd, sizeof(cmd), "ip addr add %s peer %s dev %s 2>/dev/null || ip addr replace %s peer %s dev %s",
-             server_ip, client_ip, dev, server_ip, client_ip, dev);
+    /* Assign /24 subnet to server TUN interface */
+    snprintf(cmd, sizeof(cmd), "ip addr replace %s/24 dev %s 2>/dev/null || ip addr add %s/24 dev %s",
+             server_ip, dev, server_ip, dev);
     if (system(cmd) != 0) {}
 
-    /* Bring interface UP */
+    /* Bring interface UP with MTU 1420 */
     snprintf(cmd, sizeof(cmd), "ip link set dev %s up mtu 1420", dev);
     if (system(cmd) != 0) {}
 
@@ -61,8 +62,8 @@ static inline int tun_configure_linux(const char *dev, const char *server_ip, co
     if (system("iptables -t nat -C POSTROUTING -s 10.10.10.0/24 -j MASQUERADE >/dev/null 2>&1 || "
                "iptables -t nat -A POSTROUTING -s 10.10.10.0/24 -j MASQUERADE") != 0) {}
 
-    printf("[Linux TUN] Interface %s configured: %s <-> %s (MTU 1420, NAT active)\n",
-           dev, server_ip, client_ip);
+    printf("[Linux TUN] Interface %s configured with subnet 10.10.10.0/24 (Server: %s, MTU 1420, NAT active)\n",
+           dev, server_ip);
 
     return 0;
 }
