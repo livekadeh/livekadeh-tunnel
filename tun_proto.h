@@ -11,6 +11,9 @@
 
 #define MAX_PACKET_SIZE 2048
 
+volatile uint64_t g_traffic_tx_bytes = 0;
+volatile uint64_t g_traffic_rx_bytes = 0;
+
 /* Send length-prefixed encrypted packet */
 static inline int send_tun_packet(socket_t sock, lk_chacha20_ctx *ctx, const uint8_t *packet, uint16_t len) {
     if (len == 0 || len > MAX_PACKET_SIZE) return -1;
@@ -115,6 +118,7 @@ static inline int run_linux_tun_server(int listen_port, const char *key) {
                 uint16_t plen = 0;
                 if (recv_tun_packet(sock, &ctx_rx, buf, &plen) != 0) break;
                 if (write(tun_fd, buf, plen) != (ssize_t)plen) break;
+                g_traffic_rx_bytes += plen;
             }
 
             /* TUN -> Socket */
@@ -122,6 +126,7 @@ static inline int run_linux_tun_server(int listen_port, const char *key) {
                 ssize_t n = read(tun_fd, buf, sizeof(buf));
                 if (n <= 0) break;
                 if (send_tun_packet(sock, &ctx_tx, buf, (uint16_t)n) != 0) break;
+                g_traffic_tx_bytes += (uint64_t)n;
             }
         }
 
@@ -152,6 +157,8 @@ void log_append(int level, const char *format, ...);
 static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
     win_tun_client_params_t *p = (win_tun_client_params_t *)arg;
     g_tunnel_running = 1;
+    g_traffic_tx_bytes = 0;
+    g_traffic_rx_bytes = 0;
 
     /* Step 1: Connect to remote VPN server */
     log_append(1 /* INFO */, "Connecting to tunnel server %s:%d...", p->server_host, p->server_port);
@@ -260,6 +267,7 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
             if (out_pkt) {
                 memcpy(out_pkt, recv_buf, plen);
                 pWintunSendPacket(session, out_pkt);
+                g_traffic_rx_bytes += plen;
             }
         }
 
@@ -268,6 +276,7 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
         BYTE *packet = pWintunReceivePacket(session, &packet_size);
         if (packet) {
             send_tun_packet(sock, &ctx_tx, packet, (uint16_t)packet_size);
+            g_traffic_tx_bytes += packet_size;
             pWintunReleaseReceivePacket(session, packet);
         } else {
             WaitForSingleObject(read_wait, 5);

@@ -78,6 +78,7 @@ static HWND g_hBtnToggle     = NULL;
 static HWND g_hComboLogLevel = NULL;
 static HWND g_hEditLog       = NULL;
 static HWND g_hBtnClearLog   = NULL;
+static HWND g_hLabelTraffic  = NULL;
 
 static HBRUSH g_hTerminalBrush = NULL;
 static HFONT  g_hTerminalFont  = NULL;
@@ -475,6 +476,28 @@ static void update_mode_ui(void) {
     }
 }
 
+static void format_traffic_size(uint64_t bytes, char *buf, size_t buf_len) {
+    if (bytes < 1024) {
+        snprintf(buf, buf_len, "%llu B", (unsigned long long)bytes);
+    } else if (bytes < 1024ULL * 1024) {
+        snprintf(buf, buf_len, "%.2f KB", (double)bytes / 1024.0);
+    } else if (bytes < 1024ULL * 1024 * 1024) {
+        snprintf(buf, buf_len, "%.2f MB", (double)bytes / (1024.0 * 1024.0));
+    } else {
+        snprintf(buf, buf_len, "%.2f GB", (double)bytes / (1024.0 * 1024.0 * 1024.0));
+    }
+}
+
+static void format_traffic_rate(uint64_t bytes_per_sec, char *buf, size_t buf_len) {
+    if (bytes_per_sec < 1024) {
+        snprintf(buf, buf_len, "%llu B/s", (unsigned long long)bytes_per_sec);
+    } else if (bytes_per_sec < 1024ULL * 1024) {
+        snprintf(buf, buf_len, "%.1f KB/s", (double)bytes_per_sec / 1024.0);
+    } else {
+        snprintf(buf, buf_len, "%.2f MB/s", (double)bytes_per_sec / (1024.0 * 1024.0));
+    }
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
@@ -583,10 +606,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 20, 358, 540, 240, hwnd, (HMENU)IDC_EDIT_LOG, NULL, NULL);
             SendMessage(g_hEditLog, WM_SETFONT, (WPARAM)g_hTerminalFont, TRUE);
 
+            /* Traffic Stats Label */
+            g_hLabelTraffic = CreateWindowExA(0, "STATIC", "Traffic: Idle  (Sent: 0 B   |   Recv: 0 B)",
+                WS_VISIBLE | WS_CHILD, 20, 609, 410, 20, hwnd, NULL, NULL, NULL);
+            SendMessage(g_hLabelTraffic, WM_SETFONT, (WPARAM)hFont, TRUE);
+
             /* Clear Log Button */
             g_hBtnClearLog = CreateWindowExA(0, "BUTTON", "Clear Terminal",
                 WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 440, 606, 120, 24, hwnd, (HMENU)IDC_BTN_CLEARLOG, NULL, NULL);
             SendMessage(g_hBtnClearLog, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+            SetTimer(hwnd, 1, 1000, NULL);
 
             log_append(LOG_LEVEL_INFO, "Livekadeh Tunnel ready. Running with Administrator privileges.");
             log_append(LOG_LEVEL_INFO, "Default mode: Wintun virtual network adapter (10.10.10.2 <-> 10.10.10.1)");
@@ -740,6 +770,42 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             break;
         }
 
+        case WM_TIMER: {
+            if (wParam == 1) {
+                static uint64_t last_tx = 0;
+                static uint64_t last_rx = 0;
+
+                uint64_t cur_tx = g_traffic_tx_bytes;
+                uint64_t cur_rx = g_traffic_rx_bytes;
+
+                uint64_t delta_tx = (cur_tx >= last_tx) ? (cur_tx - last_tx) : 0;
+                uint64_t delta_rx = (cur_rx >= last_rx) ? (cur_rx - last_rx) : 0;
+
+                last_tx = cur_tx;
+                last_rx = cur_rx;
+
+                if (g_is_running) {
+                    char str_tx[32], str_rx[32];
+                    char spd_tx[32], spd_rx[32];
+                    format_traffic_size(cur_tx, str_tx, sizeof(str_tx));
+                    format_traffic_size(cur_rx, str_rx, sizeof(str_rx));
+                    format_traffic_rate(delta_tx, spd_tx, sizeof(spd_tx));
+                    format_traffic_rate(delta_rx, spd_rx, sizeof(spd_rx));
+
+                    char status_text[256];
+                    snprintf(status_text, sizeof(status_text),
+                             "Traffic:  Sent: %s (%s)   |   Recv: %s (%s)",
+                             str_tx, spd_tx, str_rx, spd_rx);
+                    SetWindowTextA(g_hLabelTraffic, status_text);
+                } else {
+                    SetWindowTextA(g_hLabelTraffic, "Traffic: Idle  (Sent: 0 B   |   Recv: 0 B)");
+                    last_tx = 0;
+                    last_rx = 0;
+                }
+            }
+            break;
+        }
+
         case WM_USER + 200:
             g_is_running = 0;
             SetWindowTextA(g_hBtnToggle, "Connect Tunnel");
@@ -757,6 +823,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             break;
 
         case WM_DESTROY:
+            KillTimer(hwnd, 1);
             stop_active_tunnel();
             if (g_hTerminalBrush) DeleteObject(g_hTerminalBrush);
             if (g_hTerminalFont) DeleteObject(g_hTerminalFont);
