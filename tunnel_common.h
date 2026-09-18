@@ -161,6 +161,62 @@ static inline socket_t create_listener(const char *bind_host, int port) {
     return s;
 }
 
+/* Create UDP socket */
+static inline socket_t create_udp_socket(void) {
+    socket_t s = socket(AF_INET, SOCK_DGRAM, 0);
+    return s;
+}
+
+/* Tune UDP socket buffers */
+static inline void tune_udp_socket(socket_t sock) {
+    int buf_size = 2 * 1024 * 1024;
+#ifdef _WIN32
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char *)&buf_size, sizeof(buf_size));
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char *)&buf_size, sizeof(buf_size));
+#else
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+#endif
+}
+
+/* Create UDP listener */
+static inline socket_t create_udp_listener(const char *bind_host, int port) {
+    socket_t s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (!IS_VALIDSOCK(s)) return INVALID_SOCKET;
+
+    int opt = 1;
+#ifdef _WIN32
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
+#else
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#endif
+
+    tune_udp_socket(s);
+
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons((uint16_t)port);
+
+    if (strcmp(bind_host, "0.0.0.0") == 0 || strcmp(bind_host, "") == 0) {
+        sin.sin_addr.s_addr = INADDR_ANY;
+    } else {
+        struct hostent *he = gethostbyname(bind_host);
+        if (!he) {
+            CLOSE_SOCK(s);
+            return INVALID_SOCKET;
+        }
+        memcpy(&sin.sin_addr, he->h_addr_list[0], sizeof(sin.sin_addr));
+    }
+
+    if (bind(s, (struct sockaddr *)&sin, sizeof(sin)) == SOCKET_ERROR) {
+        CLOSE_SOCK(s);
+        return INVALID_SOCKET;
+    }
+
+    return s;
+}
+
 /* Connect to remote host */
 static inline socket_t connect_remote(const char *target_host, int port) {
     struct hostent *he = gethostbyname(target_host);

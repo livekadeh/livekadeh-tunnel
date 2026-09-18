@@ -6,10 +6,12 @@ A lightweight, high-performance, full-duplex TCP stream-encrypted tunnel and Wir
 
 ## ⚡ Key Highlights
 
-- **8-Lane Multi-TCP Transport Engine:**
-  - Establishes **8 parallel, independent encrypted TCP streams** between client and server.
-  - Effectively bypasses ISP per-connection bandwidth throttling and QoS limits.
-  - **Intelligent 5-Tuple Flow Hashing:** Automatically pins IP flows to specific lanes, guaranteeing **zero packet reordering** for seamless downloads, gaming, and video streaming.
+- **Dual-Stack Transport (Multi-TCP & UDP Datagrams):**
+  - **UDP Datagram Mode:** Ultra-low latency, stateless per-packet ChaCha20 encryption with automatic NAT mobility handling, perfect for gaming, VoIP, and UDP streaming.
+  - **8-Lane Multi-TCP Transport Engine:** Establishes **8 parallel, independent encrypted TCP streams** between client and server to bypass ISP single-stream bandwidth throttling and QoS limits.
+  - **Intelligent 5-Tuple Flow Hashing:** Pins IP flows to lanes, guaranteeing **zero packet reordering**.
+- **In-Tunnel Speed Test & Benchmark Tool:**
+  - Integrated speed test suite on port 9090 measuring real in-tunnel RTT latency, multi-stream download throughput, and upload throughput.
 - **Single Unified Binary:** Both Server and Client engines are compiled into a single executable (`livekadeh_tunnel` on Linux, `livekadeh_tunnel.exe` on Windows).
 - **Zero Handshake Footprint (Anti-DPI):** No TLS ClientHello, no certificates, no TLS SNI. The initial connection sends only a 16-byte cryptographically secure random nonce, presenting uniform random noise to DPI firewalls.
 - **WireGuard-Style Virtual Network Adapter (`Wintun`):**
@@ -113,6 +115,7 @@ Output:
 
 /ip/firewall/nat/add chain=srcnat action=masquerade src-address=172.17.0.0/24
 /ip/firewall/nat/add chain=dstnat action=dst-nat to-addresses=172.17.0.2 to-ports=8443 protocol=tcp dst-port=8443
+/ip/firewall/nat/add chain=dstnat action=dst-nat to-addresses=172.17.0.2 to-ports=8443 protocol=udp dst-port=8443
 ```
 
 #### C. Upload and Start Container:

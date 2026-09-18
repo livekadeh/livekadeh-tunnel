@@ -311,6 +311,18 @@ static inline void lk_chacha20_xor(lk_chacha20_ctx *ctx,
     }
 }
 
+/* Stateless Per-Packet ChaCha20 Cryptor for UDP Datagrams */
+static inline void lk_chacha20_crypt_packet(const uint8_t key[32],
+                                            const uint8_t nonce[12],
+                                            uint32_t counter,
+                                            const uint8_t *in,
+                                            uint8_t *out,
+                                            size_t len) {
+    lk_chacha20_ctx ctx;
+    lk_chacha20_init(&ctx, key, nonce, counter);
+    lk_chacha20_xor(&ctx, in, out, len);
+}
+
 /* Cryptographically Secure Random Bytes */
 static inline int lk_random_bytes(uint8_t *buf, size_t len) {
 #ifdef _WIN32

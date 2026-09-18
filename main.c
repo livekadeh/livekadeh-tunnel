@@ -91,6 +91,7 @@ static void print_main_help(const char *prog) {
     printf("  -s, --server <addr>   Remote tunnel server address (required)\n");
     printf("  -k, --key <key>       Shared secret key (required)\n");
     printf("  -c, --conns <1|4|8>   Number of TCP lanes (default: 8, set 1 for single-TCP)\n");
+    printf("  -u, --udp             Use UDP datagram transport (fast, low-latency, stateless)\n");
     printf("  -l, --listen <addr>   Local listen address (port-forward mode only, default: 127.0.0.1:2222)\n");
     printf("      --port-forward    Use single port forwarding instead of virtual adapter\n");
     printf("      --app <path>      Route only this app through tunnel (WFP Per-App)\n\n");
@@ -568,6 +569,7 @@ int main(int argc, char **argv) {
         char key[512] = "";
         char app_path[MAX_PATH] = "";
         int max_conns = NUM_TUNNEL_CONNS;
+        int is_udp = 0;
 #ifdef _WIN32
         int tun_mode = 1;
 #else
@@ -585,6 +587,8 @@ int main(int argc, char **argv) {
                 max_conns = atoi(argv[++i]);
                 if (max_conns < 1) max_conns = 1;
                 if (max_conns > NUM_TUNNEL_CONNS) max_conns = NUM_TUNNEL_CONNS;
+            } else if (strcmp(argv[i], "-u") == 0 || strcmp(argv[i], "--udp") == 0) {
+                is_udp = 1;
             } else if (strcmp(argv[i], "--app") == 0 && i + 1 < argc) {
                 snprintf(app_path, sizeof(app_path), "%s", argv[++i]);
                 tun_mode = 1;
@@ -621,17 +625,19 @@ int main(int argc, char **argv) {
             p->server_port = server_port;
             snprintf(p->key, sizeof(p->key), "%s", key);
             p->max_conns = max_conns;
+            p->is_udp = is_udp;
             if (strlen(app_path) > 0) {
                 p->is_per_app = 1;
                 p->num_apps = 1;
                 snprintf(p->app_paths[0], sizeof(p->app_paths[0]), "%s", app_path);
             }
 
-            HANDLE h = CreateThread(NULL, 0, win_tun_client_thread, p, 0, NULL);
+            HANDLE h = CreateThread(NULL, 0, is_udp ? win_tun_udp_client_thread : win_tun_client_thread, p, 0, NULL);
             if (h) WaitForSingleObject(h, INFINITE);
             net_cleanup();
             return 0;
 #else
+            (void)is_udp;
             fprintf(stderr, "[Error] Wintun client mode is for Windows.\n");
             net_cleanup();
             return 1;

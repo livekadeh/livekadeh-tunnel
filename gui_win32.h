@@ -156,6 +156,7 @@ static inline void ensure_admin_elevation(void) {
 /* Worker parameter structure for tunnel thread */
 typedef struct {
     int is_server;
+    int is_udp;
     int is_per_app;
     char addr[256];
     char key[512];
@@ -174,10 +175,12 @@ static DWORD WINAPI gui_tunnel_thread(LPVOID arg) {
         run_tunnel_server(listen_host, listen_port, "127.0.0.1", 22, p->key);
     } else {
         win_tun_client_params_t *tp = (win_tun_client_params_t *)malloc(sizeof(win_tun_client_params_t));
+        memset(tp, 0, sizeof(*tp));
         int server_port = 8443;
         parse_host_port(p->addr, tp->server_host, sizeof(tp->server_host), &server_port);
         tp->server_port = server_port;
         snprintf(tp->key, sizeof(tp->key), "%s", p->key);
+        tp->is_udp = p->is_udp;
         tp->is_per_app = p->is_per_app;
         tp->num_apps = p->num_apps;
         tp->max_conns = p->max_conns;
@@ -186,8 +189,13 @@ static DWORD WINAPI gui_tunnel_thread(LPVOID arg) {
             tp->app_paths[i][MAX_PATH - 1] = '\0';
         }
 
-        log_append(LOG_LEVEL_INFO, "Initializing Wintun adapter for remote server %s:%d...", tp->server_host, tp->server_port);
-        win_tun_client_thread(tp);
+        if (tp->is_udp) {
+            log_append(LOG_LEVEL_INFO, "Initializing Wintun UDP client for remote server %s:%d...", tp->server_host, tp->server_port);
+            win_tun_udp_client_thread(tp);
+        } else {
+            log_append(LOG_LEVEL_INFO, "Initializing Wintun adapter for remote server %s:%d...", tp->server_host, tp->server_port);
+            win_tun_client_thread(tp);
+        }
     }
     free(p);
     return 0;
@@ -330,8 +338,10 @@ static DWORD WINAPI speedtest_client_thread(LPVOID arg) {
     }
 
     int sel = (int)SendMessage(g_hComboConns, CB_GETCURSEL, 0, 0);
-    int streams = (sel == 2) ? 1 : ((sel == 1) ? 4 : 8);
-    const char *mode_name = (sel == 2) ? "Single-TCP (1 Lane)" : ((sel == 1) ? "Multi-TCP (4 Lanes)" : "Multi-TCP (8 Lanes)");
+    int streams = (sel == 2 || sel == 3) ? 1 : ((sel == 1) ? 4 : 8);
+    const char *mode_name = (sel == 3) ? "UDP Datagram (Fast & Low Latency)" :
+                            ((sel == 2) ? "Single-TCP (1 Lane)" :
+                            ((sel == 1) ? "Multi-TCP (4 Lanes)" : "Multi-TCP (8 Lanes)"));
 
     log_append(LOG_LEVEL_INFO, "[Speed Test] ================================================");
     log_append(LOG_LEVEL_INFO, "[Speed Test] Starting In-Tunnel Benchmark to 10.10.10.1:9090");
@@ -753,8 +763,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL, 20, 120, 340, 24, hwnd, (HMENU)IDC_EDIT_KEY, NULL, NULL);
             SendMessage(g_hEditKey, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-            /* TCP Connections Selector */
-            g_hLabelConns = CreateWindowExA(0, "STATIC", "TCP Connections:",
+            /* Transport & Connections Selector */
+            g_hLabelConns = CreateWindowExA(0, "STATIC", "Transport & Lanes:",
                 WS_VISIBLE | WS_CHILD, 375, 100, 185, 18, hwnd, NULL, NULL, NULL);
             SendMessage(g_hLabelConns, WM_SETFONT, (WPARAM)hFont, TRUE);
 
@@ -765,6 +775,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             SendMessageA(g_hComboConns, CB_ADDSTRING, 0, (LPARAM)"8 Lanes (Multi-TCP)");
             SendMessageA(g_hComboConns, CB_ADDSTRING, 0, (LPARAM)"4 Lanes (Multi-TCP)");
             SendMessageA(g_hComboConns, CB_ADDSTRING, 0, (LPARAM)"1 Lane (Single-TCP)");
+            SendMessageA(g_hComboConns, CB_ADDSTRING, 0, (LPARAM)"UDP Datagram (Fast & Low Latency)");
             SendMessageA(g_hComboConns, CB_SETCURSEL, (WPARAM)0, 0);
 
             g_hBtnGenKey = CreateWindowExA(0, "BUTTON", "Generate Key",
@@ -933,9 +944,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     }
 
                     int sel_conns = (int)SendMessage(g_hComboConns, CB_GETCURSEL, 0, 0);
-                    if (sel_conns == 2) p->max_conns = 1;
-                    else if (sel_conns == 1) p->max_conns = 4;
-                    else p->max_conns = 8;
+                    if (sel_conns == 3) {
+                        p->is_udp = 1;
+                        p->max_conns = 1;
+                    } else if (sel_conns == 2) {
+                        p->is_udp = 0;
+                        p->max_conns = 1;
+                    } else if (sel_conns == 1) {
+                        p->is_udp = 0;
+                        p->max_conns = 4;
+                    } else {
+                        p->is_udp = 0;
+                        p->max_conns = 8;
+                    }
 
                     GetWindowTextA(g_hEditAddr, p->addr, sizeof(p->addr));
                     GetWindowTextA(g_hEditKey, p->key, sizeof(p->key));

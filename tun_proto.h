@@ -44,6 +44,126 @@ static inline int recv_tun_packet(socket_t sock, lk_chacha20_ctx *ctx, uint8_t *
 
 #define SPEEDTEST_PORT 9090
 
+#define UDP_MAGIC_REQ "LK-UDP-REQ"
+#define UDP_MAGIC_ACK "LK-UDP-ACK"
+#define UDP_REQ_LEN   (10 + 16 + 32)      /* 58 bytes: Magic(10) + Nonce(16) + Tag(32) */
+#define UDP_ACK_LEN   (10 + 16 + 32 + 16) /* 74 bytes: Magic(10) + Nonce(16) + Tag(32) + Ver(16) */
+#define UDP_SALT_SIZE 4
+#define UDP_SEQ_SIZE  8
+#define UDP_HDR_SIZE  (UDP_SALT_SIZE + UDP_SEQ_SIZE) /* 12 bytes */
+#define UDP_PING_MAGIC 0xFFFFFFFD
+
+#ifndef _WIN32
+typedef struct {
+    int tun_fd;
+    socket_t udp_sock;
+    uint8_t master_key[32];
+} linux_udp_args_t;
+
+static void *linux_tun_udp_server_thread(void *arg) {
+    linux_udp_args_t *a = (linux_udp_args_t *)arg;
+    int tun_fd = a->tun_fd;
+    socket_t s = a->udp_sock;
+    uint8_t master_key[32];
+    memcpy(master_key, a->master_key, 32);
+    free(a);
+
+    struct sockaddr_in client_addr;
+    socklen_t addr_len = sizeof(client_addr);
+    memset(&client_addr, 0, sizeof(client_addr));
+    int client_active = 0;
+
+    uint32_t tx_salt = 0;
+    lk_random_bytes((uint8_t *)&tx_salt, sizeof(tx_salt));
+    uint64_t tx_seq = 0;
+
+    uint8_t buf[MAX_PACKET_SIZE + UDP_HDR_SIZE];
+
+    while (g_tunnel_running) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(s, &rfds);
+        if (client_active) {
+            FD_SET(tun_fd, &rfds);
+        }
+        int max_fd = (int)s;
+        if (client_active && tun_fd > max_fd) max_fd = tun_fd;
+
+        struct timeval tv = { 0, 50000 }; /* 50ms */
+        int sel = select(max_fd + 1, &rfds, NULL, NULL, &tv);
+        if (sel <= 0) continue;
+
+        if (FD_ISSET(s, &rfds)) {
+            struct sockaddr_in from;
+            socklen_t from_len = sizeof(from);
+            int n = recvfrom(s, (char *)buf, sizeof(buf), 0, (struct sockaddr *)&from, &from_len);
+            if (n > 0) {
+                if (n == UDP_REQ_LEN && memcmp(buf, UDP_MAGIC_REQ, 10) == 0) {
+                    uint8_t *c_nonce = buf + 10;
+                    uint8_t *tag = buf + 26;
+                    uint8_t exp_tag[32];
+                    compute_auth_tag(master_key, "LK-UDP-AUTH", c_nonce, exp_tag);
+                    if (memcmp(tag, exp_tag, 32) == 0) {
+                        uint8_t ack[UDP_ACK_LEN];
+                        memcpy(ack, UDP_MAGIC_ACK, 10);
+                        uint8_t s_nonce[16];
+                        lk_random_bytes(s_nonce, 16);
+                        memcpy(ack + 10, s_nonce, 16);
+                        compute_auth_tag(master_key, "LK-UDP-ACK", s_nonce, ack + 26);
+                        memset(ack + 58, 0, 16);
+                        strncpy((char *)(ack + 58), LIVEKADEH_VERSION, 15);
+
+                        sendto(s, (const char *)ack, UDP_ACK_LEN, 0, (struct sockaddr *)&from, from_len);
+                        memcpy(&client_addr, &from, sizeof(from));
+                        addr_len = from_len;
+                        client_active = 1;
+                        printf("[Livekadeh VPN Server] UDP Client Authenticated: %s:%d\n",
+                               inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+                    }
+                } else if (client_active && n >= (int)UDP_HDR_SIZE) {
+                    if (from.sin_addr.s_addr == client_addr.sin_addr.s_addr) {
+                        client_addr.sin_port = from.sin_port;
+                        uint8_t nonce[12];
+                        memcpy(nonce, buf, 12);
+                        size_t cipher_len = (size_t)(n - UDP_HDR_SIZE);
+                        if (cipher_len > 0) {
+                            uint8_t plain[MAX_PACKET_SIZE];
+                            lk_chacha20_crypt_packet(master_key, nonce, 0, buf + UDP_HDR_SIZE, plain, cipher_len);
+                            if (cipher_len == 4 && *(uint32_t *)plain == UDP_PING_MAGIC) {
+                                /* Keepalive received */
+                            } else {
+                                if (write(tun_fd, plain, cipher_len) > 0) {
+                                    g_traffic_rx_bytes += cipher_len;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (client_active && FD_ISSET(tun_fd, &rfds)) {
+            uint8_t pkt[MAX_PACKET_SIZE];
+            int r = read(tun_fd, pkt, sizeof(pkt));
+            if (r > 0) {
+                uint8_t out[MAX_PACKET_SIZE + UDP_HDR_SIZE];
+                uint8_t nonce[12];
+                uint64_t seq = ++tx_seq;
+                memcpy(out, &tx_salt, 4);
+                memcpy(out + 4, &seq, 8);
+                memcpy(nonce, out, 12);
+
+                lk_chacha20_crypt_packet(master_key, nonce, 0, pkt, out + UDP_HDR_SIZE, (size_t)r);
+                sendto(s, (const char *)out, (size_t)r + UDP_HDR_SIZE, 0, (struct sockaddr *)&client_addr, addr_len);
+                g_traffic_tx_bytes += (uint64_t)r;
+            }
+        }
+    }
+    CLOSE_SOCK(s);
+    return NULL;
+}
+#endif
+
 #ifndef _WIN32
 static void *speedtest_server_worker(void *arg) {
     socket_t csock = (socket_t)(intptr_t)arg;
@@ -122,16 +242,31 @@ static inline int run_linux_tun_server(int listen_port, const char *key) {
         fclose(fk);
     }
 
+    uint8_t master_key[32];
+    derive_master_key(key, master_key);
+
+    socket_t udp_sock = create_udp_listener("0.0.0.0", listen_port);
+    if (IS_VALIDSOCK(udp_sock)) {
+        linux_udp_args_t *uargs = (linux_udp_args_t *)malloc(sizeof(linux_udp_args_t));
+        uargs->tun_fd = tun_fd;
+        uargs->udp_sock = udp_sock;
+        memcpy(uargs->master_key, master_key, 32);
+        pthread_t udp_tid;
+        if (pthread_create(&udp_tid, NULL, linux_tun_udp_server_thread, uargs) == 0) {
+            pthread_detach(udp_tid);
+        } else {
+            free(uargs);
+            CLOSE_SOCK(udp_sock);
+        }
+    }
+
     printf("\n==================================================================\n");
     printf("       Livekadeh Tunnel Server (v%s)\n", LIVEKADEH_VERSION);
     printf("==================================================================\n");
     printf(" [TUN] Device:        %s (10.10.10.1 <-> 10.10.10.2)\n", dev);
-    printf(" [TCP] Listen Port:   %d\n", listen_port);
+    printf(" [NET] Dual-Stack:    TCP :%d & UDP :%d\n", listen_port, listen_port);
     printf(" [SEC] Server Key:    %s\n", key);
     printf("==================================================================\n\n");
-
-    uint8_t master_key[32];
-    derive_master_key(key, master_key);
 
     while (g_tunnel_running) {
         struct sockaddr_in client_addr;
@@ -284,6 +419,7 @@ static inline int run_linux_tun_server(int listen_port, const char *key) {
         }
     }
 
+    if (IS_VALIDSOCK(udp_sock)) CLOSE_SOCK(udp_sock);
     CLOSE_SOCK(listen_sock);
     close(tun_fd);
     return 0;
@@ -300,6 +436,7 @@ typedef struct {
     int num_apps;
     char app_paths[MAX_PER_APPS][MAX_PATH];
     int max_conns;
+    int is_udp;
 } win_tun_client_params_t;
 
 /* Forward declaration of log_append from gui_win32.h */
@@ -519,6 +656,237 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
     for (int i = 0; i < num_conns; i++) {
         CLOSE_SOCK(socks[i]);
     }
+    pWintunEndSession(session);
+    pWintunCloseAdapter(adapter);
+    free(p);
+
+    extern HWND g_hMainWnd;
+    if (g_hMainWnd) {
+        PostMessage(g_hMainWnd, WM_USER + 200, 0, 0);
+    }
+    return 0;
+}
+
+/* Windows UDP Datagram Worker */
+typedef struct {
+    WINTUN_SESSION_HANDLE session;
+    socket_t sock;
+    uint8_t master_key[32];
+    volatile int running;
+} win_udp_rx_worker_t;
+
+static DWORD WINAPI win_udp_rx_thread(LPVOID arg) {
+    win_udp_rx_worker_t *w = (win_udp_rx_worker_t *)arg;
+    uint8_t buf[MAX_PACKET_SIZE + UDP_HDR_SIZE];
+
+    while (w->running && g_tunnel_running) {
+        int n = recvfrom(w->sock, (char *)buf, sizeof(buf), 0, NULL, NULL);
+        if (n <= (int)UDP_HDR_SIZE) continue;
+
+        uint8_t nonce[12];
+        memcpy(nonce, buf, 12);
+        size_t cipher_len = (size_t)(n - UDP_HDR_SIZE);
+
+        BYTE *tun_pkt = pWintunAllocateSendPacket(w->session, (DWORD)cipher_len);
+        if (tun_pkt) {
+            lk_chacha20_crypt_packet(w->master_key, nonce, 0, buf + UDP_HDR_SIZE, tun_pkt, cipher_len);
+            pWintunSendPacket(w->session, tun_pkt);
+            g_traffic_rx_bytes += cipher_len;
+        }
+    }
+    return 0;
+}
+
+static DWORD WINAPI win_tun_udp_client_thread(LPVOID arg) {
+    win_tun_client_params_t *p = (win_tun_client_params_t *)arg;
+    g_tunnel_running = 1;
+    g_traffic_tx_bytes = 0;
+    g_traffic_rx_bytes = 0;
+
+    log_append(1 /* INFO */, "Starting Livekadeh Tunnel in UDP Datagram Mode (Fast & Low Latency)...");
+
+    socket_t s = create_udp_socket();
+    if (!IS_VALIDSOCK(s)) {
+        log_append(3 /* ERROR */, "Failed to create UDP socket.");
+        free(p);
+        return 1;
+    }
+    tune_udp_socket(s);
+
+    struct hostent *he = gethostbyname(p->server_host);
+    if (!he) {
+        log_append(3 /* ERROR */, "Cannot resolve server address: %s", p->server_host);
+        CLOSE_SOCK(s);
+        free(p);
+        return 1;
+    }
+
+    struct sockaddr_in srv_addr;
+    memset(&srv_addr, 0, sizeof(srv_addr));
+    srv_addr.sin_family = AF_INET;
+    srv_addr.sin_port = htons((uint16_t)p->server_port);
+    memcpy(&srv_addr.sin_addr, he->h_addr_list[0], sizeof(srv_addr.sin_addr));
+
+    uint8_t master_key[32];
+    derive_master_key(p->key, master_key);
+
+    log_append(1 /* INFO */, "Sending UDP Handshake to %s:%d...", p->server_host, p->server_port);
+
+    uint8_t c_nonce[16];
+    lk_random_bytes(c_nonce, 16);
+
+    uint8_t req[UDP_REQ_LEN];
+    memcpy(req, UDP_MAGIC_REQ, 10);
+    memcpy(req + 10, c_nonce, 16);
+    compute_auth_tag(master_key, "LK-UDP-AUTH", c_nonce, req + 26);
+
+    DWORD to = 1500;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
+
+    int ack_received = 0;
+    char server_version[32] = "unknown";
+
+    for (int attempt = 1; attempt <= 4; attempt++) {
+        sendto(s, (const char *)req, UDP_REQ_LEN, 0, (struct sockaddr *)&srv_addr, sizeof(srv_addr));
+
+        uint8_t ack[UDP_ACK_LEN + 32];
+        struct sockaddr_in from;
+        int from_len = sizeof(from);
+        int r = recvfrom(s, (char *)ack, sizeof(ack), 0, (struct sockaddr *)&from, &from_len);
+        if (r >= UDP_ACK_LEN && memcmp(ack, UDP_MAGIC_ACK, 10) == 0) {
+            uint8_t *s_nonce = ack + 10;
+            uint8_t *tag = ack + 26;
+            uint8_t exp_tag[32];
+            compute_auth_tag(master_key, "LK-UDP-ACK", s_nonce, exp_tag);
+            if (memcmp(tag, exp_tag, 32) == 0) {
+                snprintf(server_version, sizeof(server_version), "%s", (char *)(ack + 58));
+                ack_received = 1;
+                break;
+            } else {
+                log_append(3 /* ERROR */, "AUTHENTICATION FAILED: INVALID ENCRYPTION KEY!");
+                CLOSE_SOCK(s);
+                free(p);
+                return 1;
+            }
+        }
+        log_append(2 /* WARN */, "UDP Handshake attempt %d timed out, retrying...", attempt);
+    }
+
+    if (!ack_received) {
+        log_append(3 /* ERROR */, "Server %s:%d did not respond on UDP.", p->server_host, p->server_port);
+        CLOSE_SOCK(s);
+        free(p);
+        return 1;
+    }
+
+    log_append(1 /* INFO */, "Connected to Livekadeh Tunnel Server (UDP Mode) v%s! Authentication verified.", server_version);
+
+    DWORD to_zero = 0;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to_zero, sizeof(to_zero));
+
+    if (wintun_load_dll() != 0) {
+        log_append(3 /* ERROR */, "wintun.dll not found or failed to load.");
+        CLOSE_SOCK(s);
+        free(p);
+        return 1;
+    }
+
+    WINTUN_ADAPTER_HANDLE adapter = pWintunCreateAdapter(L"LivekadehAdapter", L"Livekadeh", NULL);
+    if (!adapter) {
+        adapter = pWintunOpenAdapter(L"LivekadehAdapter");
+        if (!adapter) {
+            log_append(3 /* ERROR */, "Cannot create or open Wintun adapter. Ensure running as Administrator!");
+            CLOSE_SOCK(s);
+            free(p);
+            return 1;
+        }
+    }
+
+    /* Configure IP 10.10.10.2 and default internet routes through Wintun */
+    log_append(1 /* INFO */, "Configuring adapter IP 10.10.10.2 and routing traffic through tunnel...");
+    wintun_configure_ip("LivekadehAdapter", "10.10.10.2", "255.255.255.0", p->server_host);
+
+    /* Setup WFP Per-App if requested */
+    if (p->is_per_app && p->num_apps > 0) {
+        log_append(1 /* INFO */, "Configuring WFP Per-App routing for %d applications...", p->num_apps);
+        for (int i = 0; i < p->num_apps; i++) {
+            log_append(0 /* DEBUG */, "  -> App: %s", p->app_paths[i]);
+        }
+        wfp_setup_per_apps((const char (*)[MAX_PATH])p->app_paths, p->num_apps, "10.10.10.2");
+    }
+
+    WINTUN_SESSION_HANDLE session = pWintunStartSession(adapter, 0x400000);
+    if (!session) {
+        log_append(3 /* ERROR */, "Failed to start Wintun session.");
+        wintun_cleanup_routes("LivekadehAdapter", p->server_host);
+        pWintunCloseAdapter(adapter);
+        CLOSE_SOCK(s);
+        free(p);
+        return 1;
+    }
+
+    log_append(1 /* INFO */, "UDP Tunnel is ACTIVE! All traffic encrypted and routed via 10.10.10.1.");
+
+    win_udp_rx_worker_t rx_w;
+    rx_w.session = session;
+    rx_w.sock = s;
+    memcpy(rx_w.master_key, master_key, 32);
+    rx_w.running = 1;
+
+    HANDLE h_rx = CreateThread(NULL, 0, win_udp_rx_thread, &rx_w, 0, NULL);
+
+    HANDLE read_wait = pWintunGetReadWaitEvent(session);
+    uint32_t tx_salt = 0;
+    lk_random_bytes((uint8_t *)&tx_salt, sizeof(tx_salt));
+    uint64_t tx_seq = 0;
+    DWORD last_send_time = GetTickCount();
+
+    uint8_t out[MAX_PACKET_SIZE + UDP_HDR_SIZE];
+
+    while (g_tunnel_running) {
+        DWORD packet_size = 0;
+        BYTE *packet = pWintunReceivePacket(session, &packet_size);
+        if (packet) {
+            if (packet_size <= MAX_PACKET_SIZE) {
+                uint64_t seq = ++tx_seq;
+                memcpy(out, &tx_salt, 4);
+                memcpy(out + 4, &seq, 8);
+                uint8_t nonce[12];
+                memcpy(nonce, out, 12);
+
+                lk_chacha20_crypt_packet(master_key, nonce, 0, packet, out + UDP_HDR_SIZE, (size_t)packet_size);
+                sendto(s, (const char *)out, (int)(packet_size + UDP_HDR_SIZE), 0, (struct sockaddr *)&srv_addr, sizeof(srv_addr));
+                g_traffic_tx_bytes += packet_size;
+                last_send_time = GetTickCount();
+            }
+            pWintunReleaseReceivePacket(session, packet);
+        } else {
+            /* Keepalive ping every 15s to keep NAT mapping alive */
+            if (GetTickCount() - last_send_time > 15000) {
+                uint64_t seq = ++tx_seq;
+                memcpy(out, &tx_salt, 4);
+                memcpy(out + 4, &seq, 8);
+                uint8_t nonce[12];
+                memcpy(nonce, out, 12);
+                uint32_t ping_magic = UDP_PING_MAGIC;
+                lk_chacha20_crypt_packet(master_key, nonce, 0, (const uint8_t *)&ping_magic, out + UDP_HDR_SIZE, 4);
+                sendto(s, (const char *)out, (int)(4 + UDP_HDR_SIZE), 0, (struct sockaddr *)&srv_addr, sizeof(srv_addr));
+                last_send_time = GetTickCount();
+            }
+            WaitForSingleObject(read_wait, 10);
+        }
+    }
+
+    log_append(1 /* INFO */, "UDP Tunnel disconnected.");
+    rx_w.running = 0;
+    CLOSE_SOCK(s);
+    if (h_rx) {
+        WaitForSingleObject(h_rx, 1000);
+        CloseHandle(h_rx);
+    }
+
+    wintun_cleanup_routes("LivekadehAdapter", p->server_host);
+    wfp_cleanup();
     pWintunEndSession(session);
     pWintunCloseAdapter(adapter);
     free(p);

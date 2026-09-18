@@ -25,6 +25,6 @@ RUN chmod +x /usr/local/bin/livekadeh_tunnel && \
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-EXPOSE 8443/tcp 9090/tcp
+EXPOSE 8443/tcp 8443/udp 9090/tcp
 
 ENTRYPOINT ["/entrypoint.sh"]
