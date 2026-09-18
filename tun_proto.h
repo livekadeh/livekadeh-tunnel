@@ -42,7 +42,60 @@ static inline int recv_tun_packet(socket_t sock, lk_chacha20_ctx *ctx, uint8_t *
     return 0;
 }
 
+#define SPEEDTEST_PORT 9090
+
 #ifndef _WIN32
+static void *speedtest_server_worker(void *arg) {
+    socket_t csock = (socket_t)(intptr_t)arg;
+    tune_tunnel_socket(csock);
+    char cmd[64] = "";
+    int r = recv(csock, cmd, sizeof(cmd) - 1, 0);
+    if (r > 0) {
+        cmd[r] = '\0';
+        if (strncmp(cmd, "PING", 4) == 0) {
+            send(csock, "PONG\n", 5, 0);
+        } else if (strncmp(cmd, "DOWNLOAD", 8) == 0) {
+            uint8_t dummy[65536];
+            memset(dummy, 0x5A, sizeof(dummy));
+            struct timespec ts_start, ts_now;
+            clock_gettime(CLOCK_MONOTONIC, &ts_start);
+            while (g_tunnel_running) {
+                clock_gettime(CLOCK_MONOTONIC, &ts_now);
+                long elapsed_ms = (ts_now.tv_sec - ts_start.tv_sec) * 1000 + (ts_now.tv_nsec - ts_start.tv_nsec) / 1000000;
+                if (elapsed_ms >= 3500) break;
+                if (send(csock, (const char *)dummy, sizeof(dummy), 0) <= 0) break;
+            }
+        } else if (strncmp(cmd, "UPLOAD", 6) == 0) {
+            uint8_t dummy[65536];
+            while (g_tunnel_running && recv(csock, (char *)dummy, sizeof(dummy), 0) > 0) {}
+        }
+    }
+    CLOSE_SOCK(csock);
+    return NULL;
+}
+
+static void *speedtest_server_thread(void *arg) {
+    (void)arg;
+    socket_t s = create_listener("0.0.0.0", SPEEDTEST_PORT);
+    if (!IS_VALIDSOCK(s)) return NULL;
+
+    while (g_tunnel_running) {
+        struct sockaddr_in caddr;
+        socklen_t clen = sizeof(caddr);
+        socket_t csock = accept(s, (struct sockaddr *)&caddr, &clen);
+        if (!IS_VALIDSOCK(csock)) continue;
+
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, speedtest_server_worker, (void *)(intptr_t)csock) == 0) {
+            pthread_detach(tid);
+        } else {
+            CLOSE_SOCK(csock);
+        }
+    }
+    CLOSE_SOCK(s);
+    return NULL;
+}
+
 /* Linux Server TUN Handler */
 static inline int run_linux_tun_server(int listen_port, const char *key) {
     char dev[IFNAMSIZ] = "tun0";
@@ -50,6 +103,11 @@ static inline int run_linux_tun_server(int listen_port, const char *key) {
     if (tun_fd < 0) return 1;
 
     tun_configure_linux(dev, "10.10.10.1", "10.10.10.2");
+
+    pthread_t st_tid;
+    if (pthread_create(&st_tid, NULL, speedtest_server_thread, NULL) == 0) {
+        pthread_detach(st_tid);
+    }
 
     socket_t listen_sock = create_listener("0.0.0.0", listen_port);
     if (!IS_VALIDSOCK(listen_sock)) {
@@ -241,6 +299,7 @@ typedef struct {
     int is_per_app;
     int num_apps;
     char app_paths[MAX_PER_APPS][MAX_PATH];
+    int max_conns;
 } win_tun_client_params_t;
 
 /* Forward declaration of log_append from gui_win32.h */
@@ -285,54 +344,61 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
 
     log_append(1 /* INFO */, "Connected to Livekadeh Tunnel Server v%s! Authentication verified.", server_version);
 
-    /* Step 2.5: Establish Multi-TCP connection pool (up to NUM_TUNNEL_CONNS) */
+    /* Step 2.5: Establish Multi-TCP connection pool (if requested) */
     tune_tunnel_socket(sock);
     socket_t socks[NUM_TUNNEL_CONNS];
     socks[0] = sock;
     int num_conns = 1;
 
-    log_append(1 /* INFO */, "Establishing %d-Lane Multi-TCP connection pool...", NUM_TUNNEL_CONNS);
+    int target_conns = (p->max_conns > 0) ? p->max_conns : NUM_TUNNEL_CONNS;
+    if (target_conns > NUM_TUNNEL_CONNS) target_conns = NUM_TUNNEL_CONNS;
 
-    for (int i = 1; i < NUM_TUNNEL_CONNS; i++) {
-        socket_t s_aux = connect_remote(p->server_host, p->server_port);
-        if (!IS_VALIDSOCK(s_aux)) break;
+    if (target_conns > 1) {
+        log_append(1 /* INFO */, "Establishing %d-Lane Multi-TCP connection pool...", target_conns);
 
-        DWORD to = 2000;
-        setsockopt(s_aux, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
+        for (int i = 1; i < target_conns; i++) {
+            socket_t s_aux = connect_remote(p->server_host, p->server_port);
+            if (!IS_VALIDSOCK(s_aux)) break;
 
-        uint8_t attach_buf[ATTACH_PACKET_SIZE];
-        make_attach_packet(master_key, c_nonce, (uint8_t)i, attach_buf);
-        if (write_exact(s_aux, attach_buf, ATTACH_PACKET_SIZE) != 0) {
-            CLOSE_SOCK(s_aux);
-            break;
+            DWORD to = 2000;
+            setsockopt(s_aux, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
+
+            uint8_t attach_buf[ATTACH_PACKET_SIZE];
+            make_attach_packet(master_key, c_nonce, (uint8_t)i, attach_buf);
+            if (write_exact(s_aux, attach_buf, ATTACH_PACKET_SIZE) != 0) {
+                CLOSE_SOCK(s_aux);
+                break;
+            }
+
+            uint8_t ack_buf[ATTACH_PACKET_SIZE];
+            if (read_exact(s_aux, ack_buf, ATTACH_PACKET_SIZE) != 0) {
+                CLOSE_SOCK(s_aux);
+                break;
+            }
+
+            uint8_t exp_tag[AUTH_TAG_SIZE];
+            uint8_t exp_data[ATTACH_PACKET_SIZE];
+            memset(exp_data, 0, sizeof(exp_data));
+            memcpy(exp_data, s_nonce, AUTH_NONCE_SIZE);
+            exp_data[AUTH_NONCE_SIZE] = (uint8_t)i;
+            compute_auth_tag(master_key, "LK-ATTACH-OK", exp_data, exp_tag);
+
+            if (memcmp(ack_buf + AUTH_NONCE_SIZE + 16, exp_tag, AUTH_TAG_SIZE) != 0) {
+                CLOSE_SOCK(s_aux);
+                break;
+            }
+
+            DWORD to_zero = 0;
+            setsockopt(s_aux, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to_zero, sizeof(to_zero));
+            tune_tunnel_socket(s_aux);
+
+            socks[num_conns++] = s_aux;
         }
 
-        uint8_t ack_buf[ATTACH_PACKET_SIZE];
-        if (read_exact(s_aux, ack_buf, ATTACH_PACKET_SIZE) != 0) {
-            CLOSE_SOCK(s_aux);
-            break;
-        }
-
-        uint8_t exp_tag[AUTH_TAG_SIZE];
-        uint8_t exp_data[ATTACH_PACKET_SIZE];
-        memset(exp_data, 0, sizeof(exp_data));
-        memcpy(exp_data, s_nonce, AUTH_NONCE_SIZE);
-        exp_data[AUTH_NONCE_SIZE] = (uint8_t)i;
-        compute_auth_tag(master_key, "LK-ATTACH-OK", exp_data, exp_tag);
-
-        if (memcmp(ack_buf + AUTH_NONCE_SIZE + 16, exp_tag, AUTH_TAG_SIZE) != 0) {
-            CLOSE_SOCK(s_aux);
-            break;
-        }
-
-        DWORD to_zero = 0;
-        setsockopt(s_aux, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to_zero, sizeof(to_zero));
-        tune_tunnel_socket(s_aux);
-
-        socks[num_conns++] = s_aux;
+        log_append(1 /* INFO */, "Multi-TCP active! %d parallel lanes connected with 5-tuple flow hashing.", num_conns);
+    } else {
+        log_append(1 /* INFO */, "Single-TCP mode active (1 connection).");
     }
-
-    log_append(1 /* INFO */, "Multi-TCP active! %d parallel lanes connected with 5-tuple flow hashing.", num_conns);
 
     /* Step 3: Initialize Wintun adapter */
     if (wintun_load_dll() != 0) {

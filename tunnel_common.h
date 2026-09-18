@@ -92,7 +92,7 @@ static inline void set_tcp_nodelay(socket_t sock) {
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char *)&opt, sizeof(opt));
 }
 
-/* Parse host and port from string "host:port" or "port" */
+/* Parse host and port from string "host:port", "host", or "port" */
 static inline int parse_host_port(const char *input, char *host, size_t host_len, int *port) {
     const char *colon = strrchr(input, ':');
     if (colon) {
@@ -106,8 +106,16 @@ static inline int parse_host_port(const char *input, char *host, size_t host_len
         }
         *port = atoi(colon + 1);
     } else {
-        snprintf(host, host_len, "0.0.0.0");
-        *port = atoi(input);
+        int all_digits = 1;
+        for (size_t k = 0; input[k]; k++) {
+            if (input[k] < '0' || input[k] > '9') { all_digits = 0; break; }
+        }
+        if (all_digits) {
+            snprintf(host, host_len, "0.0.0.0");
+            *port = atoi(input);
+        } else {
+            snprintf(host, host_len, "%s", input);
+        }
     }
     return (*port > 0 && *port <= 65535) ? 0 : -1;
 }

@@ -35,6 +35,8 @@
 #define IDC_COMBO_LOGLEVEL     1016
 #define IDC_EDIT_LOG           1017
 #define IDC_BTN_CLEARLOG       1018
+#define IDC_BTN_SPEEDTEST      1025
+#define IDC_COMBO_CONNS        1026
 
 #define IDC_PICKER_SEARCH      2001
 #define IDC_PICKER_LIST        2002
@@ -65,9 +67,12 @@ static HWND g_hRadioServer   = NULL;
 static HWND g_hLabelAddr     = NULL;
 static HWND g_hEditAddr      = NULL;
 static HWND g_hBtnTest       = NULL;
+static HWND g_hBtnSpeedTest  = NULL;
 static HWND g_hLabelKey      = NULL;
 static HWND g_hEditKey       = NULL;
 static HWND g_hBtnGenKey     = NULL;
+static HWND g_hLabelConns    = NULL;
+static HWND g_hComboConns    = NULL;
 static HWND g_hChkPerApp     = NULL;
 static HWND g_hListApps      = NULL;
 static HWND g_hBtnRunningApps = NULL;
@@ -156,6 +161,7 @@ typedef struct {
     char key[512];
     int num_apps;
     char app_paths[MAX_PER_APPS][MAX_PATH];
+    int max_conns;
 } gui_worker_params_t;
 
 static DWORD WINAPI gui_tunnel_thread(LPVOID arg) {
@@ -174,6 +180,7 @@ static DWORD WINAPI gui_tunnel_thread(LPVOID arg) {
         snprintf(tp->key, sizeof(tp->key), "%s", p->key);
         tp->is_per_app = p->is_per_app;
         tp->num_apps = p->num_apps;
+        tp->max_conns = p->max_conns;
         for (int i = 0; i < p->num_apps; i++) {
             strncpy(tp->app_paths[i], p->app_paths[i], MAX_PATH - 1);
             tp->app_paths[i][MAX_PATH - 1] = '\0';
@@ -250,6 +257,196 @@ static DWORD WINAPI test_connection_thread(LPVOID arg) {
     }
 
     EnableWindow(g_hBtnTest, TRUE);
+    return 0;
+}
+
+/* In-Tunnel Speed Test Worker Structures and Threads */
+typedef struct {
+    char host[64];
+    int port;
+    uint64_t bytes_transferred;
+    volatile int stop_signal;
+} st_worker_data_t;
+
+static DWORD WINAPI st_dl_worker(LPVOID p) {
+    st_worker_data_t *d = (st_worker_data_t *)p;
+    d->bytes_transferred = 0;
+    socket_t s = connect_remote(d->host, d->port);
+    if (!IS_VALIDSOCK(s)) return 0;
+    tune_tunnel_socket(s);
+
+    DWORD to = 5000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
+
+    if (send(s, "DOWNLOAD\n", 9, 0) != 9) {
+        CLOSE_SOCK(s);
+        return 0;
+    }
+
+    char buf[65536];
+    while (!d->stop_signal) {
+        int r = recv(s, buf, sizeof(buf), 0);
+        if (r <= 0) break;
+        d->bytes_transferred += r;
+    }
+    CLOSE_SOCK(s);
+    return 0;
+}
+
+static DWORD WINAPI st_ul_worker(LPVOID p) {
+    st_worker_data_t *d = (st_worker_data_t *)p;
+    d->bytes_transferred = 0;
+    socket_t s = connect_remote(d->host, d->port);
+    if (!IS_VALIDSOCK(s)) return 0;
+    tune_tunnel_socket(s);
+
+    DWORD to = 5000;
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&to, sizeof(to));
+
+    if (send(s, "UPLOAD\n", 7, 0) != 7) {
+        CLOSE_SOCK(s);
+        return 0;
+    }
+
+    char buf[65536];
+    memset(buf, 0x5A, sizeof(buf));
+    while (!d->stop_signal) {
+        int w = send(s, buf, sizeof(buf), 0);
+        if (w <= 0) break;
+        d->bytes_transferred += w;
+    }
+    CLOSE_SOCK(s);
+    return 0;
+}
+
+static DWORD WINAPI speedtest_client_thread(LPVOID arg) {
+    (void)arg;
+    EnableWindow(g_hBtnSpeedTest, FALSE);
+
+    if (!g_is_running || g_mode_server) {
+        log_append(LOG_LEVEL_WARN, "[Speed Test] Tunnel is not active. Click 'Connect Tunnel' first to benchmark through Wintun.");
+        EnableWindow(g_hBtnSpeedTest, TRUE);
+        return 0;
+    }
+
+    int sel = (int)SendMessage(g_hComboConns, CB_GETCURSEL, 0, 0);
+    int streams = (sel == 2) ? 1 : ((sel == 1) ? 4 : 8);
+    const char *mode_name = (sel == 2) ? "Single-TCP (1 Lane)" : ((sel == 1) ? "Multi-TCP (4 Lanes)" : "Multi-TCP (8 Lanes)");
+
+    log_append(LOG_LEVEL_INFO, "[Speed Test] ================================================");
+    log_append(LOG_LEVEL_INFO, "[Speed Test] Starting In-Tunnel Benchmark to 10.10.10.1:9090");
+    log_append(LOG_LEVEL_INFO, "[Speed Test] Mode: %s (%d stream%s)", mode_name, streams, streams > 1 ? "s" : "");
+
+    /* Step 1: Latency (Ping) */
+    double pings[4];
+    int p_ok = 0;
+    for (int i = 0; i < 4; i++) {
+        socket_t s = connect_remote("10.10.10.1", SPEEDTEST_PORT);
+        if (IS_VALIDSOCK(s)) {
+            DWORD to = 2000;
+            setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
+            DWORD t0 = GetTickCount();
+            if (send(s, "PING\n", 5, 0) == 5) {
+                char resp[32];
+                int r = recv(s, resp, sizeof(resp) - 1, 0);
+                if (r > 0 && strncmp(resp, "PONG", 4) == 0) {
+                    pings[p_ok++] = (double)(GetTickCount() - t0);
+                }
+            }
+            CLOSE_SOCK(s);
+        }
+        Sleep(50);
+    }
+
+    if (p_ok == 0) {
+        log_append(LOG_LEVEL_ERROR, "[Speed Test] Server did not respond on in-tunnel port 10.10.10.1:9090.");
+        log_append(LOG_LEVEL_WARN, "[Speed Test] Verify livekadeh-tunnel service on Linux server has port 9090 open.");
+        EnableWindow(g_hBtnSpeedTest, TRUE);
+        return 0;
+    }
+
+    double sum_p = 0, min_p = 999999.0;
+    for (int i = 0; i < p_ok; i++) {
+        sum_p += pings[i];
+        if (pings[i] < min_p) min_p = pings[i];
+    }
+    double avg_p = sum_p / p_ok;
+    log_append(LOG_LEVEL_INFO, "[Speed Test] Latency (RTT): Avg %.1f ms | Min %.1f ms", avg_p, min_p);
+
+    /* Step 2: Download Throughput */
+    log_append(LOG_LEVEL_INFO, "[Speed Test] Testing Download throughput (%d parallel stream%s)...", streams, streams > 1 ? "s" : "");
+    HANDLE dl_threads[8];
+    st_worker_data_t dl_data[8];
+    DWORD t_dl_start = GetTickCount();
+
+    for (int i = 0; i < streams; i++) {
+        snprintf(dl_data[i].host, sizeof(dl_data[i].host), "10.10.10.1");
+        dl_data[i].port = SPEEDTEST_PORT;
+        dl_data[i].bytes_transferred = 0;
+        dl_data[i].stop_signal = 0;
+        dl_threads[i] = CreateThread(NULL, 0, st_dl_worker, &dl_data[i], 0, NULL);
+    }
+
+    WaitForMultipleObjects(streams, dl_threads, TRUE, 6000);
+    DWORD dl_elapsed = GetTickCount() - t_dl_start;
+    for (int i = 0; i < streams; i++) {
+        dl_data[i].stop_signal = 1;
+        if (dl_threads[i]) CloseHandle(dl_threads[i]);
+    }
+
+    uint64_t total_dl_bytes = 0;
+    for (int i = 0; i < streams; i++) {
+        total_dl_bytes += dl_data[i].bytes_transferred;
+    }
+
+    double dl_sec = (double)dl_elapsed / 1000.0;
+    if (dl_sec < 0.5) dl_sec = 0.5;
+    double dl_mbps = ((double)total_dl_bytes * 8.0) / (dl_sec * 1000000.0);
+    double dl_mb_s = (double)total_dl_bytes / (dl_sec * 1024.0 * 1024.0);
+    log_append(LOG_LEVEL_INFO, "[Speed Test] Download: %.2f Mbps (%.2f MB/s) [%.2f MB in %.1fs]",
+               dl_mbps, dl_mb_s, (double)total_dl_bytes / (1024.0 * 1024.0), dl_sec);
+
+    /* Step 3: Upload Throughput */
+    log_append(LOG_LEVEL_INFO, "[Speed Test] Testing Upload throughput (%d parallel stream%s)...", streams, streams > 1 ? "s" : "");
+    HANDLE ul_threads[8];
+    st_worker_data_t ul_data[8];
+    DWORD t_ul_start = GetTickCount();
+
+    for (int i = 0; i < streams; i++) {
+        snprintf(ul_data[i].host, sizeof(ul_data[i].host), "10.10.10.1");
+        ul_data[i].port = SPEEDTEST_PORT;
+        ul_data[i].bytes_transferred = 0;
+        ul_data[i].stop_signal = 0;
+        ul_threads[i] = CreateThread(NULL, 0, st_ul_worker, &ul_data[i], 0, NULL);
+    }
+
+    Sleep(3500);
+    for (int i = 0; i < streams; i++) {
+        ul_data[i].stop_signal = 1;
+    }
+
+    WaitForMultipleObjects(streams, ul_threads, TRUE, 2000);
+    DWORD ul_elapsed = GetTickCount() - t_ul_start;
+    for (int i = 0; i < streams; i++) {
+        if (ul_threads[i]) CloseHandle(ul_threads[i]);
+    }
+
+    uint64_t total_ul_bytes = 0;
+    for (int i = 0; i < streams; i++) {
+        total_ul_bytes += ul_data[i].bytes_transferred;
+    }
+
+    double ul_sec = (double)ul_elapsed / 1000.0;
+    if (ul_sec < 0.5) ul_sec = 0.5;
+    double ul_mbps = ((double)total_ul_bytes * 8.0) / (ul_sec * 1000000.0);
+    double ul_mb_s = (double)total_ul_bytes / (ul_sec * 1024.0 * 1024.0);
+    log_append(LOG_LEVEL_INFO, "[Speed Test] Upload:   %.2f Mbps (%.2f MB/s) [%.2f MB in %.1fs]",
+               ul_mbps, ul_mb_s, (double)total_ul_bytes / (1024.0 * 1024.0), ul_sec);
+
+    log_append(LOG_LEVEL_INFO, "[Speed Test] Summary: Ping: %.1f ms | Down: %.2f Mbps | Up: %.2f Mbps",
+               avg_p, dl_mbps, ul_mbps);
+    log_append(LOG_LEVEL_INFO, "[Speed Test] ================================================");
+    EnableWindow(g_hBtnSpeedTest, TRUE);
     return 0;
 }
 
@@ -449,8 +646,11 @@ static void update_mode_ui(void) {
         SetWindowTextA(g_hEditAddr, "0.0.0.0:8443");
         SetWindowPos(g_hEditAddr, NULL, 20, 68, 540, 24, SWP_NOZORDER);
         ShowWindow(g_hBtnTest, SW_HIDE);
+        ShowWindow(g_hBtnSpeedTest, SW_HIDE);
         SetWindowTextA(g_hLabelKey, "Encryption Key:");
         ShowWindow(g_hBtnGenKey, SW_SHOW);
+        ShowWindow(g_hLabelConns, SW_HIDE);
+        ShowWindow(g_hComboConns, SW_HIDE);
         SetWindowPos(g_hEditKey, NULL, 20, 120, 400, 24, SWP_NOZORDER);
 
         ShowWindow(g_hChkPerApp, SW_HIDE);
@@ -462,11 +662,14 @@ static void update_mode_ui(void) {
     } else {
         SetWindowTextA(g_hLabelAddr, "Server Address (IP:Port):");
         SetWindowTextA(g_hEditAddr, "2.59.170.232:8443");
-        SetWindowPos(g_hEditAddr, NULL, 20, 68, 380, 24, SWP_NOZORDER);
+        SetWindowPos(g_hEditAddr, NULL, 20, 68, 240, 24, SWP_NOZORDER);
         ShowWindow(g_hBtnTest, SW_SHOW);
+        ShowWindow(g_hBtnSpeedTest, SW_SHOW);
         SetWindowTextA(g_hLabelKey, "Encryption Key (Paste key from server):");
         ShowWindow(g_hBtnGenKey, SW_HIDE);
-        SetWindowPos(g_hEditKey, NULL, 20, 120, 540, 24, SWP_NOZORDER);
+        ShowWindow(g_hLabelConns, SW_SHOW);
+        ShowWindow(g_hComboConns, SW_SHOW);
+        SetWindowPos(g_hEditKey, NULL, 20, 120, 340, 24, SWP_NOZORDER);
 
         ShowWindow(g_hChkPerApp, SW_SHOW);
         ShowWindow(g_hListApps, SW_SHOW);
@@ -522,28 +725,47 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 380, 15, 170, 22, hwnd, (HMENU)IDC_RADIO_SERVER, NULL, NULL);
             SendMessage(g_hRadioServer, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-            /* Server Address */
+            /* Server Address & Buttons */
             g_hLabelAddr = CreateWindowExA(0, "STATIC", "Server Address (IP:Port):",
-                WS_VISIBLE | WS_CHILD, 20, 48, 380, 18, hwnd, (HMENU)IDC_LABEL_ADDR, NULL, NULL);
+                WS_VISIBLE | WS_CHILD, 20, 48, 240, 18, hwnd, (HMENU)IDC_LABEL_ADDR, NULL, NULL);
             SendMessage(g_hLabelAddr, WM_SETFONT, (WPARAM)hFont, TRUE);
 
             g_hEditAddr = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "2.59.170.232:8443",
-                WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL, 20, 68, 380, 24, hwnd, (HMENU)IDC_EDIT_ADDR, NULL, NULL);
+                WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL, 20, 68, 240, 24, hwnd, (HMENU)IDC_EDIT_ADDR, NULL, NULL);
             SendMessage(g_hEditAddr, WM_SETFONT, (WPARAM)hFont, TRUE);
 
             /* Test Tunnel Button */
             g_hBtnTest = CreateWindowExA(0, "BUTTON", "Test Tunnel",
-                WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 410, 67, 150, 26, hwnd, (HMENU)IDC_BTN_TEST, NULL, NULL);
+                WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 270, 67, 130, 26, hwnd, (HMENU)IDC_BTN_TEST, NULL, NULL);
             SendMessage(g_hBtnTest, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+            /* Speed Test Button */
+            g_hBtnSpeedTest = CreateWindowExA(0, "BUTTON", "Speed Test",
+                WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 410, 67, 150, 26, hwnd, (HMENU)IDC_BTN_SPEEDTEST, NULL, NULL);
+            SendMessage(g_hBtnSpeedTest, WM_SETFONT, (WPARAM)hFont, TRUE);
 
             /* Key */
             g_hLabelKey = CreateWindowExA(0, "STATIC", "Encryption Key (Paste key from server):",
-                WS_VISIBLE | WS_CHILD, 20, 100, 540, 18, hwnd, (HMENU)IDC_LABEL_KEY, NULL, NULL);
+                WS_VISIBLE | WS_CHILD, 20, 100, 340, 18, hwnd, (HMENU)IDC_LABEL_KEY, NULL, NULL);
             SendMessage(g_hLabelKey, WM_SETFONT, (WPARAM)hFont, TRUE);
 
             g_hEditKey = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "0ddd412de196b2bf2110d54ec8c1fa9e1155af78cb770721d9de03034a2e6852",
-                WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL, 20, 120, 540, 24, hwnd, (HMENU)IDC_EDIT_KEY, NULL, NULL);
+                WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL, 20, 120, 340, 24, hwnd, (HMENU)IDC_EDIT_KEY, NULL, NULL);
             SendMessage(g_hEditKey, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+            /* TCP Connections Selector */
+            g_hLabelConns = CreateWindowExA(0, "STATIC", "TCP Connections:",
+                WS_VISIBLE | WS_CHILD, 375, 100, 185, 18, hwnd, NULL, NULL, NULL);
+            SendMessage(g_hLabelConns, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+            g_hComboConns = CreateWindowExA(0, "COMBOBOX", "",
+                WS_VISIBLE | WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+                375, 120, 185, 140, hwnd, (HMENU)IDC_COMBO_CONNS, NULL, NULL);
+            SendMessage(g_hComboConns, WM_SETFONT, (WPARAM)hFont, TRUE);
+            SendMessageA(g_hComboConns, CB_ADDSTRING, 0, (LPARAM)"8 Lanes (Multi-TCP)");
+            SendMessageA(g_hComboConns, CB_ADDSTRING, 0, (LPARAM)"4 Lanes (Multi-TCP)");
+            SendMessageA(g_hComboConns, CB_ADDSTRING, 0, (LPARAM)"1 Lane (Single-TCP)");
+            SendMessageA(g_hComboConns, CB_SETCURSEL, (WPARAM)0, 0);
 
             g_hBtnGenKey = CreateWindowExA(0, "BUTTON", "Generate Key",
                 WS_CHILD | BS_PUSHBUTTON, 430, 119, 130, 26, hwnd, (HMENU)IDC_BTN_GENKEY, NULL, NULL);
@@ -661,6 +883,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             } else if (wmId == IDC_BTN_TEST) {
                 HANDLE h = CreateThread(NULL, 0, test_connection_thread, NULL, 0, NULL);
                 if (h) CloseHandle(h);
+            } else if (wmId == IDC_BTN_SPEEDTEST) {
+                HANDLE h = CreateThread(NULL, 0, speedtest_client_thread, NULL, 0, NULL);
+                if (h) CloseHandle(h);
             } else if (wmId == IDC_BTN_GENKEY) {
                 char new_key[128];
                 if (generate_random_key_hex(new_key, sizeof(new_key)) == 0) {
@@ -707,6 +932,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         snprintf(p->app_paths[i], sizeof(p->app_paths[i]), "%s", g_selected_apps[i].path);
                     }
 
+                    int sel_conns = (int)SendMessage(g_hComboConns, CB_GETCURSEL, 0, 0);
+                    if (sel_conns == 2) p->max_conns = 1;
+                    else if (sel_conns == 1) p->max_conns = 4;
+                    else p->max_conns = 8;
+
                     GetWindowTextA(g_hEditAddr, p->addr, sizeof(p->addr));
                     GetWindowTextA(g_hEditKey, p->key, sizeof(p->key));
 
@@ -730,6 +960,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     EnableWindow(g_hEditAddr, FALSE);
                     EnableWindow(g_hEditKey, FALSE);
                     EnableWindow(g_hBtnGenKey, FALSE);
+                    EnableWindow(g_hComboConns, FALSE);
                     EnableWindow(g_hChkPerApp, FALSE);
                     EnableWindow(g_hListApps, FALSE);
                     EnableWindow(g_hBtnRunningApps, FALSE);
@@ -741,9 +972,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         log_append(LOG_LEVEL_INFO, "Tunnel Server starting on %s...", p->addr);
                     } else {
                         if (p->is_per_app && p->num_apps > 0) {
-                            log_append(LOG_LEVEL_INFO, "Starting Per-App VPN for %d application(s) -> %s", p->num_apps, p->addr);
+                            log_append(LOG_LEVEL_INFO, "Starting Per-App VPN (%d conns) for %d app(s) -> %s", p->max_conns, p->num_apps, p->addr);
                         } else {
-                            log_append(LOG_LEVEL_INFO, "Connecting to %s (All server ports accessible at 10.10.10.1)", p->addr);
+                            log_append(LOG_LEVEL_INFO, "Connecting to %s (%d conns, all ports accessible at 10.10.10.1)", p->addr, p->max_conns);
                         }
                     }
 
@@ -759,6 +990,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     EnableWindow(g_hEditAddr, TRUE);
                     EnableWindow(g_hEditKey, TRUE);
                     if (g_mode_server) EnableWindow(g_hBtnGenKey, TRUE);
+                    EnableWindow(g_hComboConns, TRUE);
                     EnableWindow(g_hChkPerApp, TRUE);
                     EnableWindow(g_hListApps, TRUE);
                     EnableWindow(g_hBtnRunningApps, TRUE);
@@ -815,6 +1047,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             EnableWindow(g_hEditAddr, TRUE);
             EnableWindow(g_hEditKey, TRUE);
             if (g_mode_server) EnableWindow(g_hBtnGenKey, TRUE);
+            EnableWindow(g_hComboConns, TRUE);
             EnableWindow(g_hChkPerApp, TRUE);
             EnableWindow(g_hListApps, TRUE);
             EnableWindow(g_hBtnRunningApps, TRUE);
