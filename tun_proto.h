@@ -57,8 +57,20 @@ static inline int run_linux_tun_server(int listen_port, const char *key) {
         return 1;
     }
 
-    printf("[Livekadeh VPN Server] TUN active on %s (10.10.10.1). Listening on port %d...\n",
-           dev, listen_port);
+    FILE *fk = fopen("/etc/livekadeh_tunnel.key", "w");
+    if (!fk) fk = fopen("/tmp/livekadeh_tunnel.key", "w");
+    if (fk) {
+        fprintf(fk, "%s\n", key);
+        fclose(fk);
+    }
+
+    printf("\n==================================================================\n");
+    printf("       Livekadeh Tunnel Server (v%s)\n", LIVEKADEH_VERSION);
+    printf("==================================================================\n");
+    printf(" [TUN] Device:        %s (10.10.10.1 <-> 10.10.10.2)\n", dev);
+    printf(" [TCP] Listen Port:   %d\n", listen_port);
+    printf(" [SEC] Server Key:    %s\n", key);
+    printf("==================================================================\n\n");
 
     uint8_t master_key[32];
     derive_master_key(key, master_key);

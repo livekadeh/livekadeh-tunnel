@@ -618,7 +618,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
             SetTimer(hwnd, 1, 1000, NULL);
 
-            log_append(LOG_LEVEL_INFO, "Livekadeh Tunnel ready. Running with Administrator privileges.");
+            log_append(LOG_LEVEL_INFO, "Livekadeh Tunnel v" LIVEKADEH_VERSION " ready. Running with Administrator privileges.");
             log_append(LOG_LEVEL_INFO, "Default mode: Wintun virtual network adapter (10.10.10.2 <-> 10.10.10.1)");
             break;
         }
@@ -858,7 +858,7 @@ static inline int run_win32_gui(HINSTANCE hInstance, int nCmdShow) {
     HWND hwnd = CreateWindowExA(
         WS_EX_APPWINDOW,
         "LivekadehTunnelGUI",
-        "Livekadeh Tunnel - Network Adapter (Wintun)",
+        "Livekadeh Tunnel v" LIVEKADEH_VERSION " - Network Adapter (Wintun)",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         pos_x, pos_y, win_w, win_h,
         NULL, NULL, hInstance, NULL

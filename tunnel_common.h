@@ -9,6 +9,8 @@
 
 #include "crypto.h"
 
+#define LIVEKADEH_VERSION "1.1.0"
+
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
   #include <winsock2.h>

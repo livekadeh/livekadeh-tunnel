@@ -10,18 +10,74 @@
 #include "gui_win32.h"
 #endif
 
+static void print_status(void) {
+    printf("\n==================================================================\n");
+    printf("       Livekadeh Tunnel Status (v%s)\n", LIVEKADEH_VERSION);
+    printf("==================================================================\n");
+#ifndef _WIN32
+    int is_running = (system("pgrep -f 'livekadeh_tunnel server|livekadeh server' >/dev/null 2>&1") == 0);
+    printf(" Service/Process: %s\n", is_running ? "RUNNING (Active)" : "STOPPED (Inactive)");
+
+    char saved_key[512] = "";
+    FILE *fk = fopen("/etc/livekadeh_tunnel.key", "r");
+    if (!fk) fk = fopen("/tmp/livekadeh_tunnel.key", "r");
+    if (fk) {
+        if (fgets(saved_key, sizeof(saved_key), fk)) {
+            char *p = strchr(saved_key, '\n'); if (p) *p = 0;
+            p = strchr(saved_key, '\r'); if (p) *p = 0;
+        }
+        fclose(fk);
+    }
+    if (strlen(saved_key) == 0) {
+        FILE *fs = popen("grep -oP '(?<=-k )[a-f0-9]+' /etc/systemd/system/livekadeh-tunnel.service 2>/dev/null", "r");
+        if (fs) {
+            if (fgets(saved_key, sizeof(saved_key), fs)) {
+                char *p = strchr(saved_key, '\n'); if (p) *p = 0;
+                p = strchr(saved_key, '\r'); if (p) *p = 0;
+            }
+            pclose(fs);
+        }
+    }
+    if (strlen(saved_key) > 0) {
+        printf(" Encryption Key:  %s\n", saved_key);
+    } else {
+        printf(" Encryption Key:  [Not found / Not configured]\n");
+    }
+
+    if (access("/sys/class/net/tun0", F_OK) == 0) {
+        printf(" TUN Interface:   tun0 (10.10.10.1) [ONLINE]\n");
+        unsigned long long rx = 0, tx = 0;
+        FILE *frx = fopen("/sys/class/net/tun0/statistics/rx_bytes", "r");
+        if (frx) { if (fscanf(frx, "%llu", &rx) != 1) rx = 0; fclose(frx); }
+        FILE *ftx = fopen("/sys/class/net/tun0/statistics/tx_bytes", "r");
+        if (ftx) { if (fscanf(ftx, "%llu", &tx) != 1) tx = 0; fclose(ftx); }
+        printf(" Traffic Stats:   Sent: %.2f MB | Recv: %.2f MB\n",
+               (double)tx / (1024.0 * 1024.0), (double)rx / (1024.0 * 1024.0));
+    } else {
+        printf(" TUN Interface:   tun0 [OFFLINE]\n");
+    }
+#else
+    printf(" Platform:        Windows x86_64\n");
+    printf(" Adapter:         LivekadehAdapter (Wintun)\n");
+    printf(" Default Subnet:  10.10.10.2 <-> 10.10.10.1\n");
+#endif
+    printf("==================================================================\n\n");
+}
+
 static void print_main_help(const char *prog) {
-    printf("Livekadeh Tunnel - Unified Transport & Wintun VPN Adapter\n\n");
+    printf("Livekadeh Tunnel v%s - Unified Transport & Wintun VPN Adapter\n\n", LIVEKADEH_VERSION);
     printf("Usage:\n");
     printf("  %s <command> [options]\n\n", prog);
     printf("Commands:\n");
     printf("  server                Run in server mode\n");
     printf("  client                Run in client mode (defaults to Wintun adapter on Windows)\n");
+    printf("  status, -status       Show service status, active key, and interface traffic\n");
     printf("  genkey                Generate a fresh 256-bit encryption key\n");
     printf("  --menu                Launch interactive terminal menu\n");
 #ifdef _WIN32
     printf("  --gui                 Launch graphical Windows interface\n");
 #endif
+    printf("  -v, --version         Show version information\n");
     printf("  -h, --help            Show this help message\n\n");
 
     printf("Server Options:\n");
@@ -38,6 +94,7 @@ static void print_main_help(const char *prog) {
     printf("      --app <path>      Route only this app through tunnel (WFP Per-App)\n\n");
 
     printf("Examples:\n");
+    printf("  %s -status\n", prog);
     printf("  %s genkey\n", prog);
     printf("  %s server --tun -l 0.0.0.0:8443 -k <key>\n", prog);
     printf("  %s client -s 2.59.170.232:8443 -k <key>\n", prog);
@@ -65,6 +122,18 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[1], "--menu") == 0) {
         run_interactive_cli_menu();
+        net_cleanup();
+        return 0;
+    }
+
+    if (strcmp(argv[1], "status") == 0 || strcmp(argv[1], "-status") == 0 || strcmp(argv[1], "--status") == 0) {
+        print_status();
+        net_cleanup();
+        return 0;
+    }
+
+    if (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-version") == 0 || strcmp(argv[1], "version") == 0) {
+        printf("Livekadeh Tunnel v%s\n", LIVEKADEH_VERSION);
         net_cleanup();
         return 0;
     }
