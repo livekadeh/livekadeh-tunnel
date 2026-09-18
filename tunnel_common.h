@@ -9,7 +9,7 @@
 
 #include "crypto.h"
 
-#define LIVEKADEH_VERSION "1.1.1"
+#define LIVEKADEH_VERSION "1.2.0"
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
@@ -266,6 +266,88 @@ static inline void compute_auth_tag(const uint8_t master_key[32],
     memcpy(data, label, label_len);
     memcpy(data + label_len, nonce, AUTH_NONCE_SIZE);
     lk_hmac_sha256(master_key, 32, data, label_len + AUTH_NONCE_SIZE, out_tag);
+}
+
+#define NUM_TUNNEL_CONNS 8
+#define ATTACH_PACKET_SIZE 64
+
+/* Tune socket with TCP_NODELAY and large send/recv buffers */
+static inline void tune_tunnel_socket(socket_t s) {
+    set_tcp_nodelay(s);
+    int buf = 1024 * 1024; /* 1MB socket buffer */
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *)&buf, sizeof(buf));
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char *)&buf, sizeof(buf));
+}
+
+/* 5-Tuple flow hash to guarantee in-order delivery within any TCP connection */
+static inline uint32_t flow_hash_packet(const uint8_t *pkt, size_t len) {
+    if (!pkt || len < 20) return 0;
+    uint8_t ver = pkt[0] >> 4;
+    if (ver == 4) {
+        uint32_t src_ip = *(const uint32_t *)(pkt + 12);
+        uint32_t dst_ip = *(const uint32_t *)(pkt + 16);
+        uint8_t proto = pkt[9];
+        uint16_t src_port = 0, dst_port = 0;
+        size_t ihl = (pkt[0] & 0x0F) * 4;
+        if ((proto == 6 || proto == 17) && len >= ihl + 4) {
+            src_port = *(const uint16_t *)(pkt + ihl);
+            dst_port = *(const uint16_t *)(pkt + ihl + 2);
+        }
+        uint32_t h = src_ip ^ dst_ip ^ ((uint32_t)proto << 16) ^ ((uint32_t)src_port << 16) ^ dst_port;
+        h ^= (h >> 16);
+        h *= 0x85ebca6b;
+        h ^= (h >> 13);
+        return h;
+    } else if (ver == 6 && len >= 40) {
+        uint32_t h = 0;
+        for (size_t i = 8; i < 40; i += 4) h ^= *(const uint32_t *)(pkt + i);
+        uint8_t next_hdr = pkt[6];
+        if ((next_hdr == 6 || next_hdr == 17) && len >= 44) {
+            uint16_t sp = *(const uint16_t *)(pkt + 40);
+            uint16_t dp = *(const uint16_t *)(pkt + 42);
+            h ^= ((uint32_t)sp << 16) | dp;
+        }
+        h ^= (h >> 16);
+        return h;
+    }
+    return 0;
+}
+
+/* Make attach packet for auxiliary lane */
+static inline void make_attach_packet(const uint8_t master_key[32],
+                                      const uint8_t c_nonce[AUTH_NONCE_SIZE],
+                                      uint8_t lane_idx,
+                                      uint8_t out[ATTACH_PACKET_SIZE]) {
+    memset(out, 0, ATTACH_PACKET_SIZE);
+    memcpy(out, c_nonce, AUTH_NONCE_SIZE);
+    out[AUTH_NONCE_SIZE] = lane_idx;
+
+    uint8_t data[AUTH_NONCE_SIZE + 1];
+    memcpy(data, c_nonce, AUTH_NONCE_SIZE);
+    data[AUTH_NONCE_SIZE] = lane_idx;
+
+    compute_auth_tag(master_key, "LK-ATTACH-LANE", data, out + AUTH_NONCE_SIZE + 16);
+}
+
+/* Verify attach packet on server */
+static inline int verify_attach_packet(const uint8_t master_key[32],
+                                       const uint8_t in[ATTACH_PACKET_SIZE],
+                                       uint8_t out_c_nonce[AUTH_NONCE_SIZE],
+                                       uint8_t *out_lane_idx) {
+    memcpy(out_c_nonce, in, AUTH_NONCE_SIZE);
+    *out_lane_idx = in[AUTH_NONCE_SIZE];
+
+    uint8_t data[AUTH_NONCE_SIZE + 1];
+    memcpy(data, out_c_nonce, AUTH_NONCE_SIZE);
+    data[AUTH_NONCE_SIZE] = *out_lane_idx;
+
+    uint8_t expected_tag[AUTH_TAG_SIZE];
+    compute_auth_tag(master_key, "LK-ATTACH-LANE", data, expected_tag);
+
+    if (memcmp(in + AUTH_NONCE_SIZE + 16, expected_tag, AUTH_TAG_SIZE) != 0) {
+        return -1;
+    }
+    return 0;
 }
 
 /* Perform client handshake authentication with version exchange */

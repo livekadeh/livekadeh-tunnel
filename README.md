@@ -1,4 +1,4 @@
-# Livekadeh Tunnel (لایوکده تانل) v1.1.1
+# Livekadeh Tunnel (لایوکده تانل) v1.2.0
 
 A lightweight, high-performance, full-duplex TCP stream-encrypted tunnel and WireGuard-style Virtual Network Adapter (Wintun L3 VPN). Encrypts and tunnels arbitrary network traffic (SSH, Web, RDP, databases, or specific Windows applications) between Linux / MikroTik CHR servers and Windows/Linux clients without SSL/TLS overhead, identifiable handshakes, or Deep Packet Inspection (DPI) fingerprints.
 
@@ -6,6 +6,10 @@ A lightweight, high-performance, full-duplex TCP stream-encrypted tunnel and Wir
 
 ## ⚡ Key Highlights
 
+- **8-Lane Multi-TCP Transport Engine:**
+  - Establishes **8 parallel, independent encrypted TCP streams** between client and server.
+  - Effectively bypasses ISP per-connection bandwidth throttling and QoS limits.
+  - **Intelligent 5-Tuple Flow Hashing:** Automatically pins IP flows to specific lanes, guaranteeing **zero packet reordering** for seamless downloads, gaming, and video streaming.
 - **Single Unified Binary:** Both Server and Client engines are compiled into a single executable (`livekadeh_tunnel` on Linux, `livekadeh_tunnel.exe` on Windows).
 - **Zero Handshake Footprint (Anti-DPI):** No TLS ClientHello, no certificates, no TLS SNI. The initial connection sends only a 16-byte cryptographically secure random nonce, presenting uniform random noise to DPI firewalls.
 - **WireGuard-Style Virtual Network Adapter (`Wintun`):**
@@ -13,7 +17,7 @@ A lightweight, high-performance, full-duplex TCP stream-encrypted tunnel and Wir
   - Transparent access to **all ports and protocols** on the remote server via `10.10.10.1` (SSH, HTTP/S, databases, UDP, Ping).
   - Optional **Per-App Routing** via Windows Filtering Platform (`WFP`) to tunnel only a specific `.exe` (e.g. `chrome.exe`), keeping other system traffic untouched.
 - **Server Version Negotiation:**
-  - Client automatically requests and displays the exact version of the connected server (e.g. `Connected to Livekadeh Tunnel Server v1.1.1`).
+  - Client automatically requests and displays the exact version of the connected server (e.g. `Connected to Livekadeh Tunnel Server v1.2.0`).
 - **MikroTik CHR (RouterOS v7 Container) Ready:**
   - Dedicated pre-packaged `.tar` image (`livekadeh_tunnel-mikrotik-chr.tar`) ready for MikroTik `/container/add`.
   - Automatically fetches the latest release from GitHub on container startup.
@@ -22,9 +26,6 @@ A lightweight, high-performance, full-duplex TCP stream-encrypted tunnel and Wir
   - View real-time service state, active encryption key, TUN interface status, and live TX/RX throughput using `livekadeh_tunnel -status`.
 - **Automatic Administrator Elevation on Windows:**
   - Embedded Windows Application Manifest (`requireAdministrator`) and UAC auto-elevation logic.
-- **Automatic Cryptographic Key Generation:**
-  - Auto-generates a cryptographically secure 256-bit key when run without `-k`.
-  - Standalone key generator: `livekadeh_tunnel genkey`.
 - **Dual Interface (CLI + Native Windows GUI):**
   - Full CLI support with subcommands (`server`, `client`, `genkey`, `-status`).
   - Interactive terminal menu (`--menu`).
@@ -66,10 +67,10 @@ livekadeh_tunnel/
 ## 🌐 Public GitHub Repository & Downloads
 
 - **GitHub Repository:** [https://github.com/livekadeh/livekadeh-tunnel](https://github.com/livekadeh/livekadeh-tunnel)
-- **Latest Release:** [https://github.com/livekadeh/livekadeh-tunnel/releases/tag/v1.1.1](https://github.com/livekadeh/livekadeh-tunnel/releases/tag/v1.1.1)
-- **Windows Client:** [livekadeh_tunnel-windows-x86_64.zip](https://github.com/livekadeh/livekadeh-tunnel/releases/download/v1.1.1/livekadeh_tunnel-windows-x86_64.zip)
-- **Linux Server / Client:** [livekadeh_tunnel-linux-x86_64.tar.gz](https://github.com/livekadeh/livekadeh-tunnel/releases/download/v1.1.1/livekadeh_tunnel-linux-x86_64.tar.gz)
-- **MikroTik CHR Container:** [livekadeh_tunnel-mikrotik-chr.tar](https://github.com/livekadeh/livekadeh-tunnel/releases/download/v1.1.1/livekadeh_tunnel-mikrotik-chr.tar)
+- **Latest Release:** [https://github.com/livekadeh/livekadeh-tunnel/releases/tag/v1.2.0](https://github.com/livekadeh/livekadeh-tunnel/releases/tag/v1.2.0)
+- **Windows Client:** [livekadeh_tunnel-windows-x86_64.zip](https://github.com/livekadeh/livekadeh-tunnel/releases/download/v1.2.0/livekadeh_tunnel-windows-x86_64.zip)
+- **Linux Server / Client:** [livekadeh_tunnel-linux-x86_64.tar.gz](https://github.com/livekadeh/livekadeh-tunnel/releases/download/v1.2.0/livekadeh_tunnel-linux-x86_64.tar.gz)
+- **MikroTik CHR Container:** [livekadeh_tunnel-mikrotik-chr.tar](https://github.com/livekadeh/livekadeh-tunnel/releases/download/v1.2.0/livekadeh_tunnel-mikrotik-chr.tar)
 
 ---
 
@@ -84,7 +85,7 @@ livekadeh_tunnel -status
 Output:
 ```
 ==================================================================
-       Livekadeh Tunnel Status (v1.1.1)
+       Livekadeh Tunnel Status (v1.2.0)
 ==================================================================
  Service/Process: RUNNING (Active)
  Encryption Key:  0ddd412de196b2bf2110d54ec8c1fa9e1155af78cb770721d9de03034a2e6852

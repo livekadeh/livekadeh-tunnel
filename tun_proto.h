@@ -99,52 +99,131 @@ static inline int run_linux_tun_server(int listen_port, const char *key) {
             continue;
         }
 
-        /* Reset receive timeout to 0 (normal blocking operation) */
+        /* Reset receive timeout to 0 (normal blocking operation) and tune socket */
         struct timeval tv_zero = { 0, 0 };
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv_zero, sizeof(tv_zero));
+        tune_tunnel_socket(sock);
+
+        socket_t client_socks[NUM_TUNNEL_CONNS];
+        client_socks[0] = sock;
+        int num_conns = 1;
+
+        /* Accept auxiliary connection lanes (up to NUM_TUNNEL_CONNS) within a 1-second window */
+        while (num_conns < NUM_TUNNEL_CONNS) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(listen_sock, &rfds);
+            struct timeval tv = { 0, 400000 }; /* 400ms per check */
+            int r = select((int)listen_sock + 1, &rfds, NULL, NULL, &tv);
+            if (r <= 0) break;
+
+            struct sockaddr_in aux_addr;
+            socklen_t aux_len = sizeof(aux_addr);
+            socket_t aux_sock = accept(listen_sock, (struct sockaddr *)&aux_addr, &aux_len);
+            if (!IS_VALIDSOCK(aux_sock)) break;
+
+            struct timeval to = { 1, 0 };
+            setsockopt(aux_sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
+
+            uint8_t attach_buf[ATTACH_PACKET_SIZE];
+            if (read_exact(aux_sock, attach_buf, ATTACH_PACKET_SIZE) != 0) {
+                CLOSE_SOCK(aux_sock);
+                continue;
+            }
+
+            uint8_t req_c_nonce[AUTH_NONCE_SIZE];
+            uint8_t lane_idx = 0;
+            if (verify_attach_packet(master_key, attach_buf, req_c_nonce, &lane_idx) != 0 ||
+                memcmp(req_c_nonce, c_nonce, AUTH_NONCE_SIZE) != 0 ||
+                lane_idx != (uint8_t)num_conns) {
+                CLOSE_SOCK(aux_sock);
+                continue;
+            }
+
+            /* Send attach ACK */
+            uint8_t ack_pkt[ATTACH_PACKET_SIZE];
+            memset(ack_pkt, 0, sizeof(ack_pkt));
+            memcpy(ack_pkt, s_nonce, AUTH_NONCE_SIZE);
+            ack_pkt[AUTH_NONCE_SIZE] = lane_idx;
+            compute_auth_tag(master_key, "LK-ATTACH-OK", ack_pkt, ack_pkt + AUTH_NONCE_SIZE + 16);
+            if (write_exact(aux_sock, ack_pkt, ATTACH_PACKET_SIZE) != 0) {
+                CLOSE_SOCK(aux_sock);
+                continue;
+            }
+
+            setsockopt(aux_sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv_zero, sizeof(tv_zero));
+            tune_tunnel_socket(aux_sock);
+
+            client_socks[num_conns++] = aux_sock;
+        }
 
         uint8_t key_c2s[32], key_s2c[32];
         derive_direction_key(master_key, "C2S", c_nonce, key_c2s);
         derive_direction_key(master_key, "S2C", s_nonce, key_s2c);
 
-        lk_chacha20_ctx ctx_rx, ctx_tx;
-        lk_chacha20_init(&ctx_rx, key_c2s, c_nonce, 1);
-        lk_chacha20_init(&ctx_tx, key_s2c, s_nonce, 1);
+        lk_chacha20_ctx ctx_rx[NUM_TUNNEL_CONNS], ctx_tx[NUM_TUNNEL_CONNS];
+        for (int i = 0; i < num_conns; i++) {
+            uint8_t lane_c_nonce[16], lane_s_nonce[16];
+            memcpy(lane_c_nonce, c_nonce, 16);
+            memcpy(lane_s_nonce, s_nonce, 16);
+            lane_c_nonce[15] ^= (uint8_t)i;
+            lane_s_nonce[15] ^= (uint8_t)i;
 
-        printf("[Livekadeh VPN Server] Client (v%s) authenticated from %s! Tunneling L3 packets...\n",
-               client_version, inet_ntoa(client_addr.sin_addr));
+            lk_chacha20_init(&ctx_rx[i], key_c2s, lane_c_nonce, 1);
+            lk_chacha20_init(&ctx_tx[i], key_s2c, lane_s_nonce, 1);
+        }
+
+        printf("[Livekadeh VPN Server] Client (v%s) authenticated from %s! Multi-TCP active with %d lanes.\n",
+               client_version, inet_ntoa(client_addr.sin_addr), num_conns);
 
         uint8_t buf[MAX_PACKET_SIZE];
 
         while (g_tunnel_running) {
             fd_set read_fds;
             FD_ZERO(&read_fds);
-            FD_SET(sock, &read_fds);
             FD_SET(tun_fd, &read_fds);
+            int max_fd = (int)tun_fd;
 
-            int max_fd = (sock > tun_fd ? (int)sock : tun_fd) + 1;
-            int act = select(max_fd, &read_fds, NULL, NULL, NULL);
-            if (act <= 0) break;
-
-            /* Socket -> TUN */
-            if (FD_ISSET(sock, &read_fds)) {
-                uint16_t plen = 0;
-                if (recv_tun_packet(sock, &ctx_rx, buf, &plen) != 0) break;
-                if (write(tun_fd, buf, plen) != (ssize_t)plen) break;
-                g_traffic_rx_bytes += plen;
+            for (int i = 0; i < num_conns; i++) {
+                FD_SET(client_socks[i], &read_fds);
+                if ((int)client_socks[i] > max_fd) max_fd = (int)client_socks[i];
             }
 
-            /* TUN -> Socket */
+            int act = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
+            if (act <= 0) break;
+
+            /* Inbound: Sockets -> TUN */
+            int client_alive = 1;
+            for (int i = 0; i < num_conns; i++) {
+                if (FD_ISSET(client_socks[i], &read_fds)) {
+                    uint16_t plen = 0;
+                    if (recv_tun_packet(client_socks[i], &ctx_rx[i], buf, &plen) != 0) {
+                        client_alive = 0;
+                        break;
+                    }
+                    if (write(tun_fd, buf, plen) != (ssize_t)plen) {
+                        client_alive = 0;
+                        break;
+                    }
+                    g_traffic_rx_bytes += plen;
+                }
+            }
+            if (!client_alive) break;
+
+            /* Outbound: TUN -> Sockets (5-Tuple Flow Hashed) */
             if (FD_ISSET(tun_fd, &read_fds)) {
                 ssize_t n = read(tun_fd, buf, sizeof(buf));
                 if (n <= 0) break;
-                if (send_tun_packet(sock, &ctx_tx, buf, (uint16_t)n) != 0) break;
+                int lane = (int)(flow_hash_packet(buf, (size_t)n) % (uint32_t)num_conns);
+                if (send_tun_packet(client_socks[lane], &ctx_tx[lane], buf, (uint16_t)n) != 0) break;
                 g_traffic_tx_bytes += (uint64_t)n;
             }
         }
 
         printf("[Livekadeh VPN Server] Client disconnected.\n");
-        CLOSE_SOCK(sock);
+        for (int i = 0; i < num_conns; i++) {
+            CLOSE_SOCK(client_socks[i]);
+        }
     }
 
     CLOSE_SOCK(listen_sock);
@@ -206,10 +285,59 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
 
     log_append(1 /* INFO */, "Connected to Livekadeh Tunnel Server v%s! Authentication verified.", server_version);
 
+    /* Step 2.5: Establish Multi-TCP connection pool (up to NUM_TUNNEL_CONNS) */
+    tune_tunnel_socket(sock);
+    socket_t socks[NUM_TUNNEL_CONNS];
+    socks[0] = sock;
+    int num_conns = 1;
+
+    log_append(1 /* INFO */, "Establishing %d-Lane Multi-TCP connection pool...", NUM_TUNNEL_CONNS);
+
+    for (int i = 1; i < NUM_TUNNEL_CONNS; i++) {
+        socket_t s_aux = connect_remote(p->server_host, p->server_port);
+        if (!IS_VALIDSOCK(s_aux)) break;
+
+        DWORD to = 2000;
+        setsockopt(s_aux, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
+
+        uint8_t attach_buf[ATTACH_PACKET_SIZE];
+        make_attach_packet(master_key, c_nonce, (uint8_t)i, attach_buf);
+        if (write_exact(s_aux, attach_buf, ATTACH_PACKET_SIZE) != 0) {
+            CLOSE_SOCK(s_aux);
+            break;
+        }
+
+        uint8_t ack_buf[ATTACH_PACKET_SIZE];
+        if (read_exact(s_aux, ack_buf, ATTACH_PACKET_SIZE) != 0) {
+            CLOSE_SOCK(s_aux);
+            break;
+        }
+
+        uint8_t exp_tag[AUTH_TAG_SIZE];
+        uint8_t exp_data[ATTACH_PACKET_SIZE];
+        memset(exp_data, 0, sizeof(exp_data));
+        memcpy(exp_data, s_nonce, AUTH_NONCE_SIZE);
+        exp_data[AUTH_NONCE_SIZE] = (uint8_t)i;
+        compute_auth_tag(master_key, "LK-ATTACH-OK", exp_data, exp_tag);
+
+        if (memcmp(ack_buf + AUTH_NONCE_SIZE + 16, exp_tag, AUTH_TAG_SIZE) != 0) {
+            CLOSE_SOCK(s_aux);
+            break;
+        }
+
+        DWORD to_zero = 0;
+        setsockopt(s_aux, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to_zero, sizeof(to_zero));
+        tune_tunnel_socket(s_aux);
+
+        socks[num_conns++] = s_aux;
+    }
+
+    log_append(1 /* INFO */, "Multi-TCP active! %d parallel lanes connected with 5-tuple flow hashing.", num_conns);
+
     /* Step 3: Initialize Wintun adapter */
     if (wintun_load_dll() != 0) {
         log_append(3 /* ERROR */, "Failed to load wintun.dll! Make sure wintun.dll is in the same folder.");
-        CLOSE_SOCK(sock);
+        for (int i = 0; i < num_conns; i++) CLOSE_SOCK(socks[i]);
         free(p);
         return 1;
     }
@@ -219,7 +347,7 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
         adapter = pWintunOpenAdapter(L"LivekadehAdapter");
         if (!adapter) {
             log_append(3 /* ERROR */, "Cannot create or open Wintun adapter. Ensure running as Administrator!");
-            CLOSE_SOCK(sock);
+            for (int i = 0; i < num_conns; i++) CLOSE_SOCK(socks[i]);
             free(p);
             return 1;
         }
@@ -243,7 +371,7 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
         log_append(3 /* ERROR */, "Failed to start Wintun session.");
         wintun_cleanup_routes("LivekadehAdapter", p->server_host);
         pWintunCloseAdapter(adapter);
-        CLOSE_SOCK(sock);
+        for (int i = 0; i < num_conns; i++) CLOSE_SOCK(socks[i]);
         free(p);
         return 1;
     }
@@ -252,9 +380,17 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
     derive_direction_key(master_key, "C2S", c_nonce, key_c2s);
     derive_direction_key(master_key, "S2C", s_nonce, key_s2c);
 
-    lk_chacha20_ctx ctx_tx, ctx_rx;
-    lk_chacha20_init(&ctx_tx, key_c2s, c_nonce, 1);
-    lk_chacha20_init(&ctx_rx, key_s2c, s_nonce, 1);
+    lk_chacha20_ctx ctx_tx[NUM_TUNNEL_CONNS], ctx_rx[NUM_TUNNEL_CONNS];
+    for (int i = 0; i < num_conns; i++) {
+        uint8_t lane_c_nonce[16], lane_s_nonce[16];
+        memcpy(lane_c_nonce, c_nonce, 16);
+        memcpy(lane_s_nonce, s_nonce, 16);
+        lane_c_nonce[15] ^= (uint8_t)i;
+        lane_s_nonce[15] ^= (uint8_t)i;
+
+        lk_chacha20_init(&ctx_tx[i], key_c2s, lane_c_nonce, 1);
+        lk_chacha20_init(&ctx_rx[i], key_s2c, lane_s_nonce, 1);
+    }
 
     HANDLE read_wait = pWintunGetReadWaitEvent(session);
     log_append(1 /* INFO */, "Tunnel active! All traffic encrypted and routed via 10.10.10.1.");
@@ -263,33 +399,47 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
     uint8_t recv_buf[MAX_PACKET_SIZE];
 
     while (g_tunnel_running) {
-        /* Check for inbound packet from server socket */
+        /* Check for inbound packets from any of the Multi-TCP sockets */
         fd_set read_fds;
         FD_ZERO(&read_fds);
-        FD_SET(sock, &read_fds);
-        struct timeval tv = { 0, 5000 }; /* 5ms timeout */
-
-        int act = select((int)sock + 1, &read_fds, NULL, NULL, &tv);
-        if (act > 0 && FD_ISSET(sock, &read_fds)) {
-            uint16_t plen = 0;
-            if (recv_tun_packet(sock, &ctx_rx, recv_buf, &plen) != 0) {
-                log_append(2 /* WARN */, "Server disconnected or stream interrupted.");
-                break;
-            }
-
-            BYTE *out_pkt = pWintunAllocateSendPacket(session, (DWORD)plen);
-            if (out_pkt) {
-                memcpy(out_pkt, recv_buf, plen);
-                pWintunSendPacket(session, out_pkt);
-                g_traffic_rx_bytes += plen;
-            }
+        int max_fd = 0;
+        for (int i = 0; i < num_conns; i++) {
+            FD_SET(socks[i], &read_fds);
+            if ((int)socks[i] > max_fd) max_fd = (int)socks[i];
         }
 
-        /* Check for outbound packets from Wintun */
+        struct timeval tv = { 0, 5000 }; /* 5ms timeout */
+        int act = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
+
+        int conn_drop = 0;
+        if (act > 0) {
+            for (int i = 0; i < num_conns; i++) {
+                if (FD_ISSET(socks[i], &read_fds)) {
+                    uint16_t plen = 0;
+                    if (recv_tun_packet(socks[i], &ctx_rx[i], recv_buf, &plen) != 0) {
+                        conn_drop = 1;
+                        break;
+                    }
+                    BYTE *out_pkt = pWintunAllocateSendPacket(session, (DWORD)plen);
+                    if (out_pkt) {
+                        memcpy(out_pkt, recv_buf, plen);
+                        pWintunSendPacket(session, out_pkt);
+                        g_traffic_rx_bytes += plen;
+                    }
+                }
+            }
+        }
+        if (conn_drop) {
+            log_append(2 /* WARN */, "Server stream interrupted or connection dropped.");
+            break;
+        }
+
+        /* Outbound from Wintun (5-Tuple Flow Hashed across lanes) */
         DWORD packet_size = 0;
         BYTE *packet = pWintunReceivePacket(session, &packet_size);
         if (packet) {
-            send_tun_packet(sock, &ctx_tx, packet, (uint16_t)packet_size);
+            int lane = (int)(flow_hash_packet(packet, (size_t)packet_size) % (uint32_t)num_conns);
+            send_tun_packet(socks[lane], &ctx_tx[lane], packet, (uint16_t)packet_size);
             g_traffic_tx_bytes += packet_size;
             pWintunReleaseReceivePacket(session, packet);
         } else {
@@ -300,7 +450,9 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
     log_append(1 /* INFO */, "Tunnel disconnected.");
     wintun_cleanup_routes("LivekadehAdapter", p->server_host);
     wfp_cleanup();
-    CLOSE_SOCK(sock);
+    for (int i = 0; i < num_conns; i++) {
+        CLOSE_SOCK(socks[i]);
+    }
     pWintunEndSession(session);
     pWintunCloseAdapter(adapter);
     free(p);
