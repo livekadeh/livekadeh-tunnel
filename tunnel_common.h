@@ -9,7 +9,7 @@
 
 #include "crypto.h"
 
-#define LIVEKADEH_VERSION "1.1.0"
+#define LIVEKADEH_VERSION "1.1.1"
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
@@ -218,7 +218,43 @@ static inline void derive_direction_key(const uint8_t master_key[32],
 
 #define AUTH_NONCE_SIZE 16
 #define AUTH_TAG_SIZE   32
+#define AUTH_VER_SIZE   16
 #define AUTH_PACKET_SIZE (AUTH_NONCE_SIZE + AUTH_TAG_SIZE)
+#define AUTH_FULL_PACKET_SIZE (AUTH_PACKET_SIZE + AUTH_VER_SIZE)
+
+/* Encrypt 16-byte version field using key derived from nonce */
+static inline void encrypt_version_field(const uint8_t master_key[32],
+                                         const uint8_t nonce[AUTH_NONCE_SIZE],
+                                         const char *version,
+                                         uint8_t out[AUTH_VER_SIZE]) {
+    uint8_t raw[AUTH_VER_SIZE];
+    memset(raw, 0, sizeof(raw));
+    snprintf((char *)raw, sizeof(raw), "%s", version);
+
+    uint8_t k_ver[32];
+    derive_direction_key(master_key, "LK-VER-KEY", nonce, k_ver);
+
+    lk_chacha20_ctx ctx;
+    lk_chacha20_init(&ctx, k_ver, nonce, 1);
+    lk_chacha20_xor(&ctx, raw, out, AUTH_VER_SIZE);
+}
+
+/* Decrypt 16-byte version field */
+static inline void decrypt_version_field(const uint8_t master_key[32],
+                                         const uint8_t nonce[AUTH_NONCE_SIZE],
+                                         const uint8_t in[AUTH_VER_SIZE],
+                                         char *out_version, size_t max_len) {
+    uint8_t k_ver[32];
+    derive_direction_key(master_key, "LK-VER-KEY", nonce, k_ver);
+
+    lk_chacha20_ctx ctx;
+    lk_chacha20_init(&ctx, k_ver, nonce, 1);
+    uint8_t raw[AUTH_VER_SIZE];
+    lk_chacha20_xor(&ctx, in, raw, AUTH_VER_SIZE);
+    raw[AUTH_VER_SIZE - 1] = '\0';
+
+    snprintf(out_version, max_len, "%s", (char *)raw);
+}
 
 /* Calculate authentication tag */
 static inline void compute_auth_tag(const uint8_t master_key[32],
@@ -232,19 +268,25 @@ static inline void compute_auth_tag(const uint8_t master_key[32],
     lk_hmac_sha256(master_key, 32, data, label_len + AUTH_NONCE_SIZE, out_tag);
 }
 
-/* Perform client handshake authentication */
+/* Perform client handshake authentication with version exchange */
 static inline int client_authenticate(socket_t sock, const uint8_t master_key[32],
                                       uint8_t c_nonce[AUTH_NONCE_SIZE],
-                                      uint8_t s_nonce[AUTH_NONCE_SIZE]) {
+                                      uint8_t s_nonce[AUTH_NONCE_SIZE],
+                                      char *out_server_version, size_t ver_len) {
+    if (out_server_version && ver_len > 0) {
+        snprintf(out_server_version, ver_len, "unknown");
+    }
+
     if (lk_random_bytes(c_nonce, AUTH_NONCE_SIZE) != 0) return -1;
 
-    uint8_t c_pkt[AUTH_PACKET_SIZE];
+    uint8_t c_pkt[AUTH_FULL_PACKET_SIZE];
     memcpy(c_pkt, c_nonce, AUTH_NONCE_SIZE);
     compute_auth_tag(master_key, "LK-CLIENT-AUTH", c_nonce, c_pkt + AUTH_NONCE_SIZE);
+    encrypt_version_field(master_key, c_nonce, LIVEKADEH_VERSION, c_pkt + AUTH_PACKET_SIZE);
 
-    if (write_exact(sock, c_pkt, AUTH_PACKET_SIZE) != 0) return -1;
+    if (write_exact(sock, c_pkt, AUTH_FULL_PACKET_SIZE) != 0) return -1;
 
-    uint8_t s_pkt[AUTH_PACKET_SIZE];
+    uint8_t s_pkt[AUTH_FULL_PACKET_SIZE];
     if (read_exact(sock, s_pkt, AUTH_PACKET_SIZE) != 0) return -1;
 
     memcpy(s_nonce, s_pkt, AUTH_NONCE_SIZE);
@@ -255,14 +297,36 @@ static inline int client_authenticate(socket_t sock, const uint8_t master_key[32
         return -2; /* Authentication failed: Invalid key */
     }
 
+    /* Check for server encrypted version field (16 bytes) */
+    fd_set rset;
+    FD_ZERO(&rset);
+    FD_SET(sock, &rset);
+    struct timeval tv = { 0, 100000 }; /* 100 ms timeout */
+    if (select((int)sock + 1, &rset, NULL, NULL, &tv) > 0) {
+        if (read_exact(sock, s_pkt + AUTH_PACKET_SIZE, AUTH_VER_SIZE) == 0) {
+            if (out_server_version && ver_len > 0) {
+                decrypt_version_field(master_key, s_nonce, s_pkt + AUTH_PACKET_SIZE, out_server_version, ver_len);
+            }
+        }
+    } else {
+        if (out_server_version && ver_len > 0) {
+            snprintf(out_server_version, ver_len, "1.0.0");
+        }
+    }
+
     return 0; /* Verified */
 }
 
-/* Perform server handshake authentication */
+/* Perform server handshake authentication with version exchange */
 static inline int server_authenticate(socket_t sock, const uint8_t master_key[32],
                                       uint8_t c_nonce[AUTH_NONCE_SIZE],
-                                      uint8_t s_nonce[AUTH_NONCE_SIZE]) {
-    uint8_t c_pkt[AUTH_PACKET_SIZE];
+                                      uint8_t s_nonce[AUTH_NONCE_SIZE],
+                                      char *out_client_version, size_t ver_len) {
+    if (out_client_version && ver_len > 0) {
+        snprintf(out_client_version, ver_len, "unknown");
+    }
+
+    uint8_t c_pkt[AUTH_FULL_PACKET_SIZE];
     if (read_exact(sock, c_pkt, AUTH_PACKET_SIZE) != 0) return -1;
 
     memcpy(c_nonce, c_pkt, AUTH_NONCE_SIZE);
@@ -273,13 +337,33 @@ static inline int server_authenticate(socket_t sock, const uint8_t master_key[32
         return -2; /* Authentication failed: Invalid key */
     }
 
+    /* Check if client sent 16 extra bytes for version */
+    int has_client_ver = 0;
+    fd_set rset;
+    FD_ZERO(&rset);
+    FD_SET(sock, &rset);
+    struct timeval tv = { 0, 50000 }; /* 50 ms timeout */
+    if (select((int)sock + 1, &rset, NULL, NULL, &tv) > 0) {
+        if (read_exact(sock, c_pkt + AUTH_PACKET_SIZE, AUTH_VER_SIZE) == 0) {
+            has_client_ver = 1;
+            if (out_client_version && ver_len > 0) {
+                decrypt_version_field(master_key, c_nonce, c_pkt + AUTH_PACKET_SIZE, out_client_version, ver_len);
+            }
+        }
+    }
+
     if (lk_random_bytes(s_nonce, AUTH_NONCE_SIZE) != 0) return -1;
 
-    uint8_t s_pkt[AUTH_PACKET_SIZE];
+    uint8_t s_pkt[AUTH_FULL_PACKET_SIZE];
     memcpy(s_pkt, s_nonce, AUTH_NONCE_SIZE);
     compute_auth_tag(master_key, "LK-SERVER-AUTH", s_nonce, s_pkt + AUTH_NONCE_SIZE);
 
-    if (write_exact(sock, s_pkt, AUTH_PACKET_SIZE) != 0) return -1;
+    if (has_client_ver) {
+        encrypt_version_field(master_key, s_nonce, LIVEKADEH_VERSION, s_pkt + AUTH_PACKET_SIZE);
+        if (write_exact(sock, s_pkt, AUTH_FULL_PACKET_SIZE) != 0) return -1;
+    } else {
+        if (write_exact(sock, s_pkt, AUTH_PACKET_SIZE) != 0) return -1;
+    }
 
     return 0; /* Verified */
 }

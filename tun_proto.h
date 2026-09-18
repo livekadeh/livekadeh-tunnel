@@ -89,8 +89,9 @@ static inline int run_linux_tun_server(int listen_port, const char *key) {
 
         uint8_t c_nonce[AUTH_NONCE_SIZE];
         uint8_t s_nonce[AUTH_NONCE_SIZE];
+        char client_version[64] = "unknown";
 
-        int auth_res = server_authenticate(sock, master_key, c_nonce, s_nonce);
+        int auth_res = server_authenticate(sock, master_key, c_nonce, s_nonce, client_version, sizeof(client_version));
         if (auth_res != 0) {
             printf("[Livekadeh VPN Server] Unauthorized probe or invalid key from %s (Rejected)\n",
                    inet_ntoa(client_addr.sin_addr));
@@ -110,8 +111,8 @@ static inline int run_linux_tun_server(int listen_port, const char *key) {
         lk_chacha20_init(&ctx_rx, key_c2s, c_nonce, 1);
         lk_chacha20_init(&ctx_tx, key_s2c, s_nonce, 1);
 
-        printf("[Livekadeh VPN Server] Client authenticated from %s! Tunneling L3 packets...\n",
-               inet_ntoa(client_addr.sin_addr));
+        printf("[Livekadeh VPN Server] Client (v%s) authenticated from %s! Tunneling L3 packets...\n",
+               client_version, inet_ntoa(client_addr.sin_addr));
 
         uint8_t buf[MAX_PACKET_SIZE];
 
@@ -188,7 +189,8 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
     /* Step 2: Perform cryptographic mutual authentication */
     log_append(0 /* DEBUG */, "Sending challenge authentication probe...");
     uint8_t c_nonce[AUTH_NONCE_SIZE], s_nonce[AUTH_NONCE_SIZE];
-    int auth_res = client_authenticate(sock, master_key, c_nonce, s_nonce);
+    char server_version[64] = "unknown";
+    int auth_res = client_authenticate(sock, master_key, c_nonce, s_nonce, server_version, sizeof(server_version));
 
     if (auth_res == -2) {
         log_append(3 /* ERROR */, "AUTHENTICATION FAILED: INVALID ENCRYPTION KEY! Server rejected connection.");
@@ -202,7 +204,7 @@ static DWORD WINAPI win_tun_client_thread(LPVOID arg) {
         return 1;
     }
 
-    log_append(1 /* INFO */, "Authentication verified! Encryption key is valid.");
+    log_append(1 /* INFO */, "Connected to Livekadeh Tunnel Server v%s! Authentication verified.", server_version);
 
     /* Step 3: Initialize Wintun adapter */
     if (wintun_load_dll() != 0) {

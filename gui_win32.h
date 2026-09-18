@@ -230,17 +230,18 @@ static DWORD WINAPI test_connection_thread(LPVOID arg) {
         uint8_t master_key[32];
         derive_master_key(key, master_key);
         uint8_t c_nonce[AUTH_NONCE_SIZE], s_nonce[AUTH_NONCE_SIZE];
+        char server_ver[64] = "unknown";
 
         DWORD to = 3000;
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
 
-        int auth = client_authenticate(s, master_key, c_nonce, s_nonce);
+        int auth = client_authenticate(s, master_key, c_nonce, s_nonce, server_ver, sizeof(server_ver));
         CLOSE_SOCK(s);
 
         DWORD total_time = GetTickCount() - start;
         if (auth == 0) {
-            log_append(LOG_LEVEL_INFO, "[Server Probe] SUCCESS: Server is ONLINE and key is VALID! (RTT: %lu ms)", total_time);
-            log_append(LOG_LEVEL_INFO, "[Server Probe] Click 'Connect Tunnel' to start virtual adapter and test L3 ping.");
+            log_append(LOG_LEVEL_INFO, "[Server Probe] SUCCESS: Connected to Livekadeh Tunnel Server v%s! (RTT: %lu ms)", server_ver, total_time);
+            log_append(LOG_LEVEL_INFO, "[Server Probe] Encryption key verified. Click 'Connect Tunnel' to start virtual adapter.");
         } else if (auth == -2) {
             log_append(LOG_LEVEL_ERROR, "[Server Probe] FAILED: Server is ONLINE but ENCRYPTION KEY IS INVALID!");
         } else {
