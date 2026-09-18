@@ -1,4 +1,4 @@
-# Livekadeh Tunnel (لایوکده تانل) v1.2.0
+# Livekadeh Tunnel (لایوکده تانل) v1.3.0
 
 A lightweight, high-performance, full-duplex TCP stream-encrypted tunnel and WireGuard-style Virtual Network Adapter (Wintun L3 VPN). Encrypts and tunnels arbitrary network traffic (SSH, Web, RDP, databases, or specific Windows applications) between Linux / MikroTik CHR servers and Windows/Linux clients without SSL/TLS overhead, identifiable handshakes, or Deep Packet Inspection (DPI) fingerprints.
 
@@ -6,6 +6,9 @@ A lightweight, high-performance, full-duplex TCP stream-encrypted tunnel and Wir
 
 ## ⚡ Key Highlights
 
+- **Multi-Client Support with Dynamic IP Pool (10.10.10.2 - 10.10.10.254):**
+  - Allows up to **253 concurrent users** to connect simultaneously using the same shared encryption key.
+  - Automatic IP negotiation, non-blocking auxiliary lane attachment, and live client session tracking.
 - **Dual-Stack Transport (Multi-TCP & UDP Datagrams):**
   - **UDP Datagram Mode:** Ultra-low latency, stateless per-packet ChaCha20 encryption with automatic NAT mobility handling, perfect for gaming, VoIP, and UDP streaming.
   - **8-Lane Multi-TCP Transport Engine:** Establishes **8 parallel, independent encrypted TCP streams** between client and server to bypass ISP single-stream bandwidth throttling and QoS limits.
@@ -69,10 +72,10 @@ livekadeh_tunnel/
 ## 🌐 Public GitHub Repository & Downloads
 
 - **GitHub Repository:** [https://github.com/livekadeh/livekadeh-tunnel](https://github.com/livekadeh/livekadeh-tunnel)
-- **Latest Release:** [https://github.com/livekadeh/livekadeh-tunnel/releases/tag/v1.2.0](https://github.com/livekadeh/livekadeh-tunnel/releases/tag/v1.2.0)
-- **Windows Client:** [livekadeh_tunnel-windows-x86_64.zip](https://github.com/livekadeh/livekadeh-tunnel/releases/download/v1.2.0/livekadeh_tunnel-windows-x86_64.zip)
-- **Linux Server / Client:** [livekadeh_tunnel-linux-x86_64.tar.gz](https://github.com/livekadeh/livekadeh-tunnel/releases/download/v1.2.0/livekadeh_tunnel-linux-x86_64.tar.gz)
-- **MikroTik CHR Container:** [livekadeh_tunnel-mikrotik-chr.tar](https://github.com/livekadeh/livekadeh-tunnel/releases/download/v1.2.0/livekadeh_tunnel-mikrotik-chr.tar)
+- **Latest Release:** [https://github.com/livekadeh/livekadeh-tunnel/releases/tag/v1.3.0](https://github.com/livekadeh/livekadeh-tunnel/releases/tag/v1.3.0)
+- **Windows Client:** [livekadeh_tunnel-windows-x86_64.zip](https://github.com/livekadeh/livekadeh-tunnel/releases/download/v1.3.0/livekadeh_tunnel-windows-x86_64.zip)
+- **Linux Server / Client:** [livekadeh_tunnel-linux-x86_64.tar.gz](https://github.com/livekadeh/livekadeh-tunnel/releases/download/v1.3.0/livekadeh_tunnel-linux-x86_64.tar.gz)
+- **MikroTik CHR Container:** [livekadeh_tunnel-mikrotik-chr.tar](https://github.com/livekadeh/livekadeh-tunnel/releases/download/v1.3.0/livekadeh_tunnel-mikrotik-chr.tar)
 
 ---
 
@@ -87,12 +90,14 @@ livekadeh_tunnel -status
 Output:
 ```
 ==================================================================
-       Livekadeh Tunnel Status (v1.2.0)
+       Livekadeh Tunnel Status (v1.3.0)
 ==================================================================
  Service/Process: RUNNING (Active)
  Encryption Key:  0ddd412de196b2bf2110d54ec8c1fa9e1155af78cb770721d9de03034a2e6852
  TUN Interface:   tun0 (10.10.10.1) [ONLINE]
  Traffic Stats:   Sent: 89.30 MB | Recv: 13.93 MB
+ Connected Clients:
+   - 10.10.10.2 [TCP 8-Lanes] 37.148.64.23:20423 (v1.3.0)
 ==================================================================
 ```
 

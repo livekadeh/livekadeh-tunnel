@@ -9,7 +9,7 @@
 
 #include "crypto.h"
 
-#define LIVEKADEH_VERSION "1.2.0"
+#define LIVEKADEH_VERSION "1.3.0"
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
