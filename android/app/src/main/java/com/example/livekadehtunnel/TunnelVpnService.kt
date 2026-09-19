@@ -7,6 +7,8 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -15,6 +17,10 @@ import android.util.Log
 class TunnelVpnService : VpnService() {
     private var vpnInterface: ParcelFileDescriptor? = null
     private var vpnThread: Thread? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
+    @Volatile
+    private var userWantsConnected = false
 
     companion object {
         const val ACTION_CONNECT = "com.example.livekadehtunnel.CONNECT"
@@ -53,6 +59,9 @@ class TunnelVpnService : VpnService() {
         external fun clearNativeLogs()
 
         @JvmStatic
+        external fun setDebugMode(enable: Boolean)
+
+        @JvmStatic
         fun protectSocket(fd: Int): Boolean {
             val s = instance
             return if (s != null) {
@@ -73,6 +82,7 @@ class TunnelVpnService : VpnService() {
         super.onCreate()
         instance = this
         createNotificationChannel()
+        registerNetworkCallback()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -85,7 +95,10 @@ class TunnelVpnService : VpnService() {
         val serverAddr = intent?.getStringExtra("serverAddr") ?: return START_NOT_STICKY
         val port = intent.getIntExtra("port", 8443)
         val key = intent.getStringExtra("key") ?: return START_NOT_STICKY
-        val mode = intent.getIntExtra("mode", 0)
+        val mode = intent.getIntExtra("mode", -1)
+        val debug = intent.getBooleanExtra("debug", false)
+
+        setDebugMode(debug)
 
         try {
             val notif = buildNotification("Livekadeh Tunnel ($serverAddr:$port)")
@@ -95,7 +108,7 @@ class TunnelVpnService : VpnService() {
                 startForeground(NOTIF_ID, notif)
             }
         } catch (t: Throwable) {
-            Log.w("TunnelVPN", "Could not startForeground: ${t.message}")
+            Log.w("TunnelVPN", "startForeground failed: ${t.message}")
         }
 
         startTunnel(serverAddr, port, key, mode)
@@ -123,34 +136,54 @@ class TunnelVpnService : VpnService() {
     }
 
     private fun startTunnel(serverAddr: String, port: Int, key: String, mode: Int) {
-        isRunning = true
+        userWantsConnected = true
+        vpnThread?.interrupt()
+
         vpnThread = Thread {
-            Log.i("TunnelVPN", "Starting native tunnel to $serverAddr:$port, mode=$mode")
-            try {
-                startNativeTunnel(serverAddr, port, key, mode)
-            } catch (t: Throwable) {
-                Log.e("TunnelVPN", "Native tunnel error", t)
+            var attempt = 0
+            while (userWantsConnected) {
+                attempt++
+                isRunning = true
+                Log.i("TunnelVPN", "Starting tunnel attempt #$attempt to $serverAddr:$port (mode=$mode)...")
+                try {
+                    startNativeTunnel(serverAddr, port, key, mode)
+                } catch (t: Throwable) {
+                    Log.e("TunnelVPN", "Native tunnel exception", t)
+                }
+                isRunning = false
+
+                if (!userWantsConnected) break
+
+                Log.w("TunnelVPN", "Tunnel dropped. Auto-reconnecting in 3 seconds (attempt #$attempt)...")
+                try {
+                    Thread.sleep(3000)
+                } catch (e: InterruptedException) {
+                    break
+                }
             }
-            Log.i("TunnelVPN", "Native tunnel finished")
-            isRunning = false
             stopSelf()
         }
         vpnThread?.start()
     }
 
     private fun stopTunnel() {
+        userWantsConnected = false
         isRunning = false
         try {
             stopNativeTunnel()
         } catch (t: Throwable) {
             Log.w("TunnelVPN", "Error stopping native tunnel: ${t.message}")
         }
+        vpnThread?.interrupt()
+        vpnThread = null
+
         try {
             vpnInterface?.close()
         } catch (e: Throwable) {
             Log.e("TunnelVPN", "Error closing vpnInterface", e)
         }
         vpnInterface = null
+
         try {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } catch (t: Throwable) {
@@ -159,8 +192,47 @@ class TunnelVpnService : VpnService() {
         stopSelf()
     }
 
+    private fun registerNetworkCallback() {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val callback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    super.onAvailable(network)
+                    if (userWantsConnected && !isRunning) {
+                        Log.i("TunnelVPN", "Network switch/available detected! Waking reconnect thread...")
+                        vpnThread?.interrupt()
+                    }
+                }
+
+                override fun onLost(network: Network) {
+                    super.onLost(network)
+                    Log.w("TunnelVPN", "Underlying network lost: $network")
+                    if (userWantsConnected) {
+                        // Native tunnel will notice failure on read/recvfrom and reconnect automatically
+                    }
+                }
+            }
+            networkCallback = callback
+            cm.registerDefaultNetworkCallback(callback)
+        } catch (t: Throwable) {
+            Log.w("TunnelVPN", "Failed to register network callback", t)
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        try {
+            val cb = networkCallback ?: return
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            cm.unregisterNetworkCallback(cb)
+            networkCallback = null
+        } catch (t: Throwable) {
+            // Ignored
+        }
+    }
+
     override fun onDestroy() {
         stopTunnel()
+        unregisterNetworkCallback()
         instance = null
         super.onDestroy()
     }

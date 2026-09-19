@@ -1,9 +1,13 @@
 package com.example.livekadehtunnel
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.net.VpnService
 import android.os.Bundle
 import android.util.Log
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -20,6 +24,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -31,7 +36,8 @@ class MainActivity : ComponentActivity() {
     private var pendingServerAddr = ""
     private var pendingPort = 8443
     private var pendingKey = ""
-    private var pendingMode = 0
+    private var pendingMode = -1
+    private var pendingDebug = false
 
     private val vpnRequest = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == RESULT_OK) {
@@ -57,11 +63,23 @@ class MainActivity : ComponentActivity() {
                     color = MaterialTheme.colorScheme.background
                 ) {
                     TunnelScreen(
-                        onConnect = { addr, port, key, mode ->
+                        onConnect = { addr, port, key, mode, debug ->
                             pendingServerAddr = addr
                             pendingPort = port
                             pendingKey = key
                             pendingMode = mode
+                            pendingDebug = debug
+
+                            // Save to SharedPreferences for Quick Settings Tile & Next Launch
+                            val prefs = getSharedPreferences("tunnel_prefs", Context.MODE_PRIVATE)
+                            prefs.edit()
+                                .putString("server_addr", addr)
+                                .putInt("port", port)
+                                .putString("key", key)
+                                .putInt("mode", mode)
+                                .putBoolean("debug", debug)
+                                .apply()
+
                             try {
                                 val intent = VpnService.prepare(this)
                                 if (intent != null) {
@@ -97,11 +115,12 @@ class MainActivity : ComponentActivity() {
             putExtra("port", pendingPort)
             putExtra("key", pendingKey)
             putExtra("mode", pendingMode)
+            putExtra("debug", pendingDebug)
         }
         try {
             startService(intent)
         } catch (t: Throwable) {
-            Log.w("MainActivity", "startService failed, attempting startForegroundService", t)
+            Log.w("MainActivity", "startService failed, trying startForegroundService", t)
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
                 try {
                     startForegroundService(intent)
@@ -116,10 +135,11 @@ class MainActivity : ComponentActivity() {
 data class ConnectionMode(val name: String, val modeValue: Int)
 
 val connectionModes = listOf(
-    ConnectionMode("UDP Datagram (Fast & Low Latency)", 0),
+    ConnectionMode("Auto (UDP with Multi-TCP Fallback)", -1),
     ConnectionMode("8 Lanes (Multi-TCP)", 8),
     ConnectionMode("4 Lanes (Multi-TCP)", 4),
-    ConnectionMode("1 Lane (Single-TCP)", 1)
+    ConnectionMode("1 Lane (Single-TCP)", 1),
+    ConnectionMode("UDP Datagram (Fast & Low Latency)", 0)
 )
 
 fun formatBytes(bytes: Long): String {
@@ -143,15 +163,29 @@ fun formatSpeed(bytesPerSec: Long): String {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TunnelScreen(
-    onConnect: (String, Int, String, Int) -> Unit,
+    onConnect: (String, Int, String, Int, Boolean) -> Unit,
     onDisconnect: () -> Unit
 ) {
-    var serverIp by remember { mutableStateOf("2.59.170.232") }
-    var portStr by remember { mutableStateOf("8443") }
-    var key by remember { mutableStateOf("0ddd412de196b2bf2110d54ec8c1fa9e1155af78cb770721d9de03034a2e6852") }
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("tunnel_prefs", Context.MODE_PRIVATE) }
 
-    var selectedModeIndex by remember { mutableStateOf(0) }
+    var serverIp by remember { mutableStateOf(prefs.getString("server_addr", "2.59.170.232") ?: "2.59.170.232") }
+    var portStr by remember { mutableStateOf(prefs.getInt("port", 8443).toString()) }
+    var key by remember {
+        mutableStateOf(
+            prefs.getString("key", "0ddd412de196b2bf2110d54ec8c1fa9e1155af78cb770721d9de03034a2e6852")
+                ?: "0ddd412de196b2bf2110d54ec8c1fa9e1155af78cb770721d9de03034a2e6852"
+        )
+    }
+
+    val savedMode = remember { prefs.getInt("mode", -1) }
+    var selectedModeIndex by remember {
+        mutableStateOf(
+            connectionModes.indexOfFirst { it.modeValue == savedMode }.let { if (it >= 0) it else 0 }
+        )
+    }
     var dropdownExpanded by remember { mutableStateOf(false) }
+    var debugMode by remember { mutableStateOf(prefs.getBoolean("debug", false)) }
 
     var isConnected by remember { mutableStateOf(false) }
     var txSpeed by remember { mutableStateOf(0L) }
@@ -189,7 +223,7 @@ fun TunnelScreen(
 
                 logText = TunnelVpnService.getNativeLogs()
             } catch (t: Throwable) {
-                // Ignore stats polling error
+                // Ignore polling errors
             }
 
             delay(1000)
@@ -226,7 +260,7 @@ fun TunnelScreen(
             }
         }
 
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(14.dp))
 
         // Configuration Card
         Card(
@@ -303,10 +337,41 @@ fun TunnelScreen(
                         }
                     }
                 }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Full Debug Mode Toggle
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Full Debug Mode",
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = "Verbose diagnostic logs for troubleshooting",
+                            fontSize = 11.sp,
+                            color = Color.Gray
+                        )
+                    }
+                    Switch(
+                        checked = debugMode,
+                        onCheckedChange = {
+                            debugMode = it
+                            TunnelVpnService.setDebugMode(it)
+                            prefs.edit().putBoolean("debug", it).apply()
+                        },
+                        enabled = true
+                    )
+                }
             }
         }
 
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(14.dp))
 
         // Connect / Disconnect Buttons
         if (!isConnected) {
@@ -314,7 +379,7 @@ fun TunnelScreen(
                 onClick = {
                     val port = portStr.toIntOrNull() ?: 8443
                     val mode = connectionModes[selectedModeIndex].modeValue
-                    onConnect(serverIp, port, key, mode)
+                    onConnect(serverIp, port, key, mode, debugMode)
                 },
                 shape = RoundedCornerShape(12.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
@@ -337,7 +402,7 @@ fun TunnelScreen(
             }
         }
 
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(14.dp))
 
         // Traffic Speed & Data Counters Card
         Card(
@@ -352,7 +417,7 @@ fun TunnelScreen(
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.primary
                 )
-                Spacer(modifier = Modifier.height(12.dp))
+                Spacer(modifier = Modifier.height(10.dp))
 
                 Row(modifier = Modifier.fillMaxWidth()) {
                     Column(modifier = Modifier.weight(1f)) {
@@ -382,9 +447,9 @@ fun TunnelScreen(
             }
         }
 
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(14.dp))
 
-        // Live Log Terminal Viewer
+        // Live Log Terminal Viewer with Action Bar
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier.fillMaxWidth()
@@ -396,6 +461,40 @@ fun TunnelScreen(
                 color = MaterialTheme.colorScheme.primary
             )
             Spacer(modifier = Modifier.weight(1f))
+
+            // Copy Button
+            TextButton(
+                onClick = {
+                    if (logText.isNotBlank()) {
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        val clip = ClipData.newPlainText("Livekadeh Logs", logText)
+                        clipboard.setPrimaryClip(clip)
+                        Toast.makeText(context, "Logs copied to clipboard", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            ) {
+                Text("Copy", color = Color(0xFF00E5FF), fontSize = 12.sp)
+            }
+
+            // Share Button
+            TextButton(
+                onClick = {
+                    if (logText.isNotBlank()) {
+                        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                            type = "text/plain"
+                            putExtra(Intent.EXTRA_SUBJECT, "Livekadeh Tunnel Logs")
+                            putExtra(Intent.EXTRA_TEXT, logText)
+                        }
+                        context.startActivity(Intent.createChooser(shareIntent, "Share Livekadeh Logs"))
+                    } else {
+                        Toast.makeText(context, "No logs to share yet", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            ) {
+                Text("Share", color = Color(0xFF00E676), fontSize = 12.sp)
+            }
+
+            // Clear Button
             TextButton(onClick = { TunnelVpnService.clearNativeLogs() }) {
                 Text("Clear", color = Color.Gray, fontSize = 12.sp)
             }
@@ -406,7 +505,7 @@ fun TunnelScreen(
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(200.dp)
+                .height(220.dp)
                 .background(Color(0xFF0A0A0A), RoundedCornerShape(8.dp))
                 .padding(8.dp)
         ) {
@@ -432,6 +531,7 @@ fun TunnelScreen(
                         val color = when {
                             line.contains("[ERROR]") -> Color(0xFFFF5252)
                             line.contains("[WARN]") -> Color(0xFFFFD740)
+                            line.contains("[DEBUG]") -> Color(0xFFB388FF)
                             line.contains("[INFO]") -> Color(0xFF00E5FF)
                             else -> Color(0xFFE0E0E0)
                         }
@@ -445,6 +545,16 @@ fun TunnelScreen(
                 }
             }
         }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        // Quick Settings Tile Notice
+        Text(
+            text = "Tip: You can add 'Livekadeh' to your phone's Quick Settings drop-down tiles for 1-tap connect/disconnect.",
+            fontSize = 11.sp,
+            color = Color.Gray,
+            lineHeight = 16.sp
+        )
 
         Spacer(modifier = Modifier.height(20.dp))
     }

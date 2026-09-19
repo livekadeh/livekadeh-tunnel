@@ -11,6 +11,8 @@
 #include <poll.h>
 #include <time.h>
 
+static volatile int g_debug_mode = 0;
+
 #define LOGI(...) do { \
     __android_log_print(ANDROID_LOG_INFO, "TunnelNative", __VA_ARGS__); \
     char __tmp[512]; \
@@ -30,6 +32,15 @@
     char __tmp[512]; \
     snprintf(__tmp, sizeof(__tmp), __VA_ARGS__); \
     append_log("WARN", __tmp); \
+} while(0)
+
+#define LOGD(...) do { \
+    if (g_debug_mode) { \
+        __android_log_print(ANDROID_LOG_DEBUG, "TunnelNative", __VA_ARGS__); \
+        char __tmp[512]; \
+        snprintf(__tmp, sizeof(__tmp), __VA_ARGS__); \
+        append_log("DEBUG", __tmp); \
+    } \
 } while(0)
 
 #include "tunnel_common.h"
@@ -74,16 +85,22 @@ typedef struct {
 
 static volatile uint64_t g_traffic_tx = 0;
 static volatile uint64_t g_traffic_rx = 0;
-static char g_log_buf[32768] = {0};
+static char g_log_buf[65536] = {0};
 static int g_log_len = 0;
 static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void append_log(const char* level, const char* msg) {
     pthread_mutex_lock(&g_log_mutex);
-    int len = snprintf(NULL, 0, "[%s] %s\n", level, msg);
+    time_t now = time(NULL);
+    struct tm tm_buf;
+    localtime_r(&now, &tm_buf);
+    char time_str[16];
+    snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d", tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
+
+    int len = snprintf(NULL, 0, "[%s] [%s] %s\n", time_str, level, msg);
     if (len > 0) {
         if (g_log_len + len >= (int)sizeof(g_log_buf)) {
-            int shift = (g_log_len + len) - (int)sizeof(g_log_buf) + 2048;
+            int shift = (g_log_len + len) - (int)sizeof(g_log_buf) + 4096;
             if (shift < g_log_len) {
                 memmove(g_log_buf, g_log_buf + shift, g_log_len - shift);
                 g_log_len -= shift;
@@ -91,7 +108,7 @@ static void append_log(const char* level, const char* msg) {
                 g_log_len = 0;
             }
         }
-        g_log_len += snprintf(g_log_buf + g_log_len, sizeof(g_log_buf) - g_log_len, "[%s] %s\n", level, msg);
+        g_log_len += snprintf(g_log_buf + g_log_len, sizeof(g_log_buf) - g_log_len, "[%s] [%s] %s\n", time_str, level, msg);
     }
     pthread_mutex_unlock(&g_log_mutex);
 }
@@ -109,7 +126,7 @@ static void protect_socket_via_jvm(JNIEnv* env, int sock) {
         jmethodID mid = (*env)->GetStaticMethodID(env, cls, "protectSocket", "(I)Z");
         if (mid) {
             jboolean res = (*env)->CallStaticBooleanMethod(env, cls, mid, (jint)sock);
-            LOGI("VPN protect socket fd=%d status=%s", sock, res ? "OK" : "FAILED");
+            LOGD("VpnService.protect(socket=%d) returned %s", sock, res ? "TRUE" : "FALSE");
         }
         (*env)->DeleteLocalRef(env, cls);
     }
@@ -135,6 +152,8 @@ static int establish_vpn_via_jvm(JNIEnv* env, const char* assigned_ip) {
 static void* android_udp_rx_thread(void* arg) {
     android_udp_rx_worker_t* w = (android_udp_rx_worker_t*)arg;
     uint8_t buf[MAX_PACKET_SIZE + UDP_HDR_SIZE];
+
+    LOGD("UDP RX thread started on socket fd=%d", w->sock);
 
     while (w->running && g_android_tunnel_running) {
         int n = recvfrom(w->sock, (char*)buf, sizeof(buf), 0, NULL, NULL);
@@ -162,6 +181,7 @@ static void* android_udp_rx_thread(void* arg) {
             free(tun_pkt);
         }
     }
+    LOGD("UDP RX thread exiting");
     return NULL;
 }
 
@@ -171,30 +191,35 @@ static int run_udp_client(JNIEnv* env, const char* srv_addr_cstr, int port, cons
 
     g_udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (g_udp_sock < 0) {
-        LOGE("Failed to create UDP socket");
+        LOGE("Failed to create UDP socket: %s", strerror(errno));
         return -1;
     }
 
     protect_socket_via_jvm(env, g_udp_sock);
 
-    struct hostent *he = gethostbyname(srv_addr_cstr);
-    if (!he) {
-        LOGE("Cannot resolve server address: %s", srv_addr_cstr);
-        close(g_udp_sock);
-        g_udp_sock = -1;
-        return -1;
-    }
-
     struct sockaddr_in srv_addr_in;
     memset(&srv_addr_in, 0, sizeof(srv_addr_in));
     srv_addr_in.sin_family = AF_INET;
     srv_addr_in.sin_port = htons((uint16_t)port);
-    memcpy(&srv_addr_in.sin_addr, he->h_addr_list[0], sizeof(srv_addr_in.sin_addr));
+
+    if (inet_pton(AF_INET, srv_addr_cstr, &srv_addr_in.sin_addr) <= 0) {
+        LOGD("Resolving domain %s via gethostbyname...", srv_addr_cstr);
+        struct hostent *he = gethostbyname(srv_addr_cstr);
+        if (!he) {
+            LOGE("Cannot resolve server address: %s (errno=%s)", srv_addr_cstr, strerror(errno));
+            close(g_udp_sock);
+            g_udp_sock = -1;
+            return -1;
+        }
+        memcpy(&srv_addr_in.sin_addr, he->h_addr_list[0], sizeof(srv_addr_in.sin_addr));
+    }
+
+    LOGD("Resolved server address: %s:%d", inet_ntoa(srv_addr_in.sin_addr), port);
 
     uint8_t master_key[32];
     derive_master_key(key_cstr, master_key);
 
-    LOGI("Sending UDP Handshake probe to %s:%d...", srv_addr_cstr, port);
+    LOGI("Preparing UDP Handshake to %s:%d...", srv_addr_cstr, port);
 
     uint8_t c_nonce[16];
     lk_random_bytes(c_nonce, 16);
@@ -205,16 +230,20 @@ static int run_udp_client(JNIEnv* env, const char* srv_addr_cstr, int port, cons
     compute_auth_tag(master_key, "LK-UDP-AUTH", c_nonce, req + 26);
 
     struct timeval tv;
-    tv.tv_sec = 1;
-    tv.tv_usec = 500000;
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
     setsockopt(g_udp_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     int ack_received = 0;
     char server_version[64] = "unknown";
     char assigned_ip[64] = "10.10.10.2";
 
-    for (int attempt = 1; attempt <= 4 && g_android_tunnel_running; attempt++) {
-        sendto(g_udp_sock, (char*)req, UDP_REQ_LEN, 0, (struct sockaddr *)&srv_addr_in, sizeof(srv_addr_in));
+    for (int attempt = 1; attempt <= 6 && g_android_tunnel_running; attempt++) {
+        LOGI("Sending UDP Handshake attempt %d/6 (%d bytes)...", attempt, UDP_REQ_LEN);
+        ssize_t st = sendto(g_udp_sock, (char*)req, UDP_REQ_LEN, 0, (struct sockaddr *)&srv_addr_in, sizeof(srv_addr_in));
+        if (st < 0) {
+            LOGE("sendto failed: %s (errno=%d)", strerror(errno), errno);
+        }
         
         uint8_t ack_buf[UDP_ACK_LEN + 32];
         struct sockaddr_in from;
@@ -234,20 +263,25 @@ static int run_udp_client(JNIEnv* env, const char* srv_addr_cstr, int port, cons
                     snprintf(assigned_ip, sizeof(assigned_ip), "%s", at + 1);
                 }
                 ack_received = 1;
-                LOGI("Connected to Server v%s! Assigned IP: %s", server_version, assigned_ip);
+                LOGI("Connected to Server v%s! Assigned IP: %s (from %s:%d)",
+                     server_version, assigned_ip, inet_ntoa(from.sin_addr), ntohs(from.sin_port));
                 break;
             } else {
-                LOGE("AUTHENTICATION FAILED: INVALID ENCRYPTION KEY!");
+                LOGE("AUTHENTICATION FAILED: INVALID ENCRYPTION KEY! Server rejected connection.");
                 close(g_udp_sock);
                 g_udp_sock = -1;
                 return -1;
             }
+        } else if (n < 0) {
+            LOGW("Attempt %d/6 timed out or error: %s (errno=%d)", attempt, strerror(errno), errno);
+        } else {
+            LOGW("Attempt %d/6 received unexpected packet (%d bytes)", attempt, n);
         }
-        LOGW("UDP Handshake attempt %d timed out, retrying...", attempt);
     }
 
     if (!ack_received) {
-        LOGE("Server %s:%d did not respond on UDP.", srv_addr_cstr, port);
+        LOGE("UDP Handshake failed after 6 attempts to %s:%d.", srv_addr_cstr, port);
+        LOGE("Carrier mobile data might be filtering UDP traffic. Switch to Multi-TCP (8 Lanes) mode.");
         close(g_udp_sock);
         g_udp_sock = -1;
         return -1;
@@ -318,6 +352,7 @@ static int run_udp_client(JNIEnv* env, const char* srv_addr_cstr, int port, cons
                 lk_chacha20_crypt_packet(master_key, nonce, 0, (const uint8_t *)&ping_magic, udp_buf + UDP_HDR_SIZE, 4);
                 sendto(g_udp_sock, (char*)udp_buf, 4 + UDP_HDR_SIZE, 0, (struct sockaddr *)&srv_addr_in, sizeof(srv_addr_in));
                 last_send_time = time(NULL);
+                LOGD("Sent UDP keepalive ping");
             }
         }
     }
@@ -336,27 +371,31 @@ static int run_tcp_client(JNIEnv* env, const char* srv_addr_cstr, int port, cons
 
     socket_t sock = socket(AF_INET, SOCK_STREAM, 0);
     if (!IS_VALIDSOCK(sock)) {
-        LOGE("Failed to create TCP socket");
+        LOGE("Failed to create TCP socket: %s", strerror(errno));
         return -1;
     }
 
     protect_socket_via_jvm(env, sock);
 
-    struct hostent *he = gethostbyname(srv_addr_cstr);
-    if (!he) {
-        LOGE("Cannot resolve server address: %s", srv_addr_cstr);
-        CLOSE_SOCK(sock);
-        return -1;
-    }
-
     struct sockaddr_in srv_addr;
     memset(&srv_addr, 0, sizeof(srv_addr));
     srv_addr.sin_family = AF_INET;
     srv_addr.sin_port = htons((uint16_t)port);
-    memcpy(&srv_addr.sin_addr, he->h_addr_list[0], sizeof(srv_addr.sin_addr));
 
+    if (inet_pton(AF_INET, srv_addr_cstr, &srv_addr.sin_addr) <= 0) {
+        LOGD("Resolving domain %s via gethostbyname...", srv_addr_cstr);
+        struct hostent *he = gethostbyname(srv_addr_cstr);
+        if (!he) {
+            LOGE("Cannot resolve server address: %s (errno=%s)", srv_addr_cstr, strerror(errno));
+            CLOSE_SOCK(sock);
+            return -1;
+        }
+        memcpy(&srv_addr.sin_addr, he->h_addr_list[0], sizeof(srv_addr.sin_addr));
+    }
+
+    LOGD("Connecting TCP to %s:%d...", inet_ntoa(srv_addr.sin_addr), port);
     if (connect(sock, (struct sockaddr *)&srv_addr, sizeof(srv_addr)) != 0) {
-        LOGE("Cannot connect to server %s:%d. Verify IP, port, and firewall.", srv_addr_cstr, port);
+        LOGE("Cannot connect to server %s:%d (%s). Verify IP, port, and firewall.", srv_addr_cstr, port, strerror(errno));
         CLOSE_SOCK(sock);
         return -1;
     }
@@ -364,7 +403,7 @@ static int run_tcp_client(JNIEnv* env, const char* srv_addr_cstr, int port, cons
     uint8_t master_key[32];
     derive_master_key(key_cstr, master_key);
 
-    LOGI("Sending challenge authentication probe...");
+    LOGI("Sending challenge authentication probe via TCP...");
     uint8_t c_nonce[AUTH_NONCE_SIZE], s_nonce[AUTH_NONCE_SIZE];
     char server_version[64] = "unknown";
     int auth_res = client_authenticate(sock, master_key, c_nonce, s_nonce, server_version, sizeof(server_version));
@@ -566,9 +605,19 @@ static jint internal_startNativeTunnel(
     const char *key_cstr = (*env)->GetStringUTFChars(env, key, 0);
 
     int res = 0;
-    if (mode == 0) {
+    if (mode == -1) {
+        /* Auto Mode: Try UDP first, if fails fallback to 8-Lane Multi-TCP */
+        LOGI("Auto Mode: Trying UDP Datagram first...");
+        res = run_udp_client(env, srv_addr_cstr, port, key_cstr);
+        if (res != 0 && g_android_tunnel_running) {
+            LOGW("UDP connection dropped or filtered. Falling back to 8-Lane Multi-TCP...");
+            res = run_tcp_client(env, srv_addr_cstr, port, key_cstr, 8);
+        }
+    } else if (mode == 0) {
+        /* UDP Datagram */
         res = run_udp_client(env, srv_addr_cstr, port, key_cstr);
     } else {
+        /* TCP Mode: mode is the number of lanes (1, 4, 8) */
         res = run_tcp_client(env, srv_addr_cstr, port, key_cstr, mode);
     }
 
@@ -683,4 +732,20 @@ Java_com_example_livekadehtunnel_TunnelVpnService_00024Companion_clearNativeLogs
     g_log_buf[0] = '\0';
     g_log_len = 0;
     pthread_mutex_unlock(&g_log_mutex);
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_livekadehtunnel_TunnelVpnService_setDebugMode(JNIEnv* env, jobject obj, jboolean enable) {
+    (void)env;
+    (void)obj;
+    g_debug_mode = enable ? 1 : 0;
+    LOGI("Verbose debug logging %s", g_debug_mode ? "ENABLED" : "DISABLED");
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_livekadehtunnel_TunnelVpnService_00024Companion_setDebugMode(JNIEnv* env, jobject obj, jboolean enable) {
+    (void)env;
+    (void)obj;
+    g_debug_mode = enable ? 1 : 0;
+    LOGI("Verbose debug logging %s", g_debug_mode ? "ENABLED" : "DISABLED");
 }
