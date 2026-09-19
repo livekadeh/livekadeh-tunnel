@@ -10,6 +10,10 @@
 #include <shellapi.h>
 
 #define WM_TRAYICON (WM_USER + 1)
+
+#define IDC_TRAY_SHOW 2001
+#define IDC_TRAY_EXIT 2002
+
 static NOTIFYICONDATAA g_nid;
 
 #include <shlobj.h>
@@ -608,7 +612,9 @@ static LRESULT CALLBACK ProcessPickerWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             DestroyWindow(hwnd);
             break;
 
+
         case WM_DESTROY:
+
             if (g_hMainWnd) EnableWindow(g_hMainWnd, TRUE);
             SetForegroundWindow(g_hMainWnd);
             g_hPickerDlg = NULL;
@@ -885,6 +891,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (lParam == WM_LBUTTONUP || lParam == WM_LBUTTONDBLCLK) {
                 ShowWindow(hwnd, SW_RESTORE);
                 SetForegroundWindow(hwnd);
+            } else if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU) {
+                POINT pt;
+                GetCursorPos(&pt);
+                HMENU hMenu = CreatePopupMenu();
+                InsertMenu(hMenu, 0, MF_BYPOSITION | MF_STRING, IDC_TRAY_SHOW, "Show Tunnel");
+                InsertMenu(hMenu, 1, MF_BYPOSITION | MF_STRING, IDC_TRAY_EXIT, "Exit");
+                SetForegroundWindow(hwnd);
+                TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, NULL);
+                DestroyMenu(hMenu);
             }
             break;
 
@@ -902,6 +917,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case WM_COMMAND: {
             int wmId = LOWORD(wParam);
+
+            if (wmId == IDC_TRAY_SHOW) {
+                ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+                return 0;
+            }
+            if (wmId == IDC_TRAY_EXIT) {
+                DestroyWindow(hwnd);
+                return 0;
+            }
 
             if (wmId == IDC_RADIO_CLIENT && HIWORD(wParam) == BN_CLICKED) {
                 if (!g_is_running) {
@@ -1107,6 +1132,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             EnableWindow(g_hBtnRemoveApp, TRUE);
             EnableWindow(g_hBtnClearApps, TRUE);
             break;
+
+        case WM_CLOSE:
+            ShowWindow(hwnd, SW_HIDE);
+            return 0;
 
         case WM_DESTROY:
             KillTimer(hwnd, 1);
