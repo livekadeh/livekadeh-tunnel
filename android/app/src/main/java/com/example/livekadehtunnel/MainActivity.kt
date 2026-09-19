@@ -146,9 +146,9 @@ fun TunnelScreen(
     onConnect: (String, Int, String, Int) -> Unit,
     onDisconnect: () -> Unit
 ) {
-    var serverIp by remember { mutableStateOf("162.217.249.229") }
+    var serverIp by remember { mutableStateOf("2.59.170.232") }
     var portStr by remember { mutableStateOf("8443") }
-    var key by remember { mutableStateOf("odd44ade196b2bf2110d54ec8c1fa9e3") }
+    var key by remember { mutableStateOf("0ddd412de196b2bf2110d54ec8c1fa9e1155af78cb770721d9de03034a2e6852") }
 
     var selectedModeIndex by remember { mutableStateOf(0) }
     var dropdownExpanded by remember { mutableStateOf(false) }

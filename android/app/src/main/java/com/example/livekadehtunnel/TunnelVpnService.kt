@@ -35,7 +35,7 @@ class TunnelVpnService : VpnService() {
         }
 
         @JvmStatic
-        external fun startNativeTunnel(fd: Int, serverAddr: String, port: Int, key: String, mode: Int): Int
+        external fun startNativeTunnel(serverAddr: String, port: Int, key: String, mode: Int): Int
 
         @JvmStatic
         external fun stopNativeTunnel()
@@ -60,6 +60,12 @@ class TunnelVpnService : VpnService() {
             } else {
                 false
             }
+        }
+
+        @JvmStatic
+        fun establishVpnInterface(assignedIp: String): Int {
+            val s = instance ?: return -1
+            return s.createTunInterface(assignedIp)
         }
     }
 
@@ -96,35 +102,34 @@ class TunnelVpnService : VpnService() {
         return START_STICKY
     }
 
-    private fun startTunnel(serverAddr: String, port: Int, key: String, mode: Int) {
+    fun createTunInterface(assignedIp: String): Int {
+        try {
+            vpnInterface?.close()
+        } catch (e: Throwable) {
+            // Ignored
+        }
+
         val builder = Builder()
         builder.setSession("Livekadeh Tunnel")
-            .addAddress("10.10.10.2", 24)
+            .addAddress(assignedIp, 24)
             .addRoute("0.0.0.0", 0)
             .addDnsServer("1.1.1.1")
             .addDnsServer("8.8.8.8")
             .setMtu(1400)
 
-        try {
-            vpnInterface = builder.establish()
-        } catch (e: Throwable) {
-            Log.e("TunnelVPN", "Exception establishing VPN interface", e)
-        }
+        val vpn = builder.establish() ?: return -1
+        vpnInterface = vpn
+        return vpn.fd
+    }
 
-        val fd = vpnInterface?.fd ?: -1
-        if (fd < 0) {
-            Log.e("TunnelVPN", "Failed to establish VPN interface (fd < 0)")
-            stopSelf()
-            return
-        }
-
+    private fun startTunnel(serverAddr: String, port: Int, key: String, mode: Int) {
         isRunning = true
         vpnThread = Thread {
-            Log.i("TunnelVPN", "Starting native tunnel on fd $fd, mode=$mode")
+            Log.i("TunnelVPN", "Starting native tunnel to $serverAddr:$port, mode=$mode")
             try {
-                startNativeTunnel(fd, serverAddr, port, key, mode)
+                startNativeTunnel(serverAddr, port, key, mode)
             } catch (t: Throwable) {
-                Log.e("TunnelVPN", "Native tunnel crashed or failed", t)
+                Log.e("TunnelVPN", "Native tunnel error", t)
             }
             Log.i("TunnelVPN", "Native tunnel finished")
             isRunning = false

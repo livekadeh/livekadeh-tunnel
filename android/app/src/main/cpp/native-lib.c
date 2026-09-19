@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <time.h>
 
 #define LOGI(...) do { \
     __android_log_print(ANDROID_LOG_INFO, "TunnelNative", __VA_ARGS__); \
@@ -42,6 +43,7 @@
 #define UDP_SALT_SIZE 4
 #define UDP_SEQ_SIZE  8
 #define UDP_HDR_SIZE  (UDP_SALT_SIZE + UDP_SEQ_SIZE)
+#define UDP_PING_MAGIC 0xFFFFFFFD
 
 static inline int send_tun_packet(socket_t sock, lk_chacha20_ctx *ctx, const uint8_t *packet, uint16_t len) {
     if (len == 0 || len > MAX_PACKET_SIZE) return -1;
@@ -113,6 +115,22 @@ static void protect_socket_via_jvm(JNIEnv* env, int sock) {
     }
 }
 
+static int establish_vpn_via_jvm(JNIEnv* env, const char* assigned_ip) {
+    if (!env || !assigned_ip) return -1;
+    jclass cls = (*env)->FindClass(env, "com/example/livekadehtunnel/TunnelVpnService");
+    if (!cls) return -1;
+    jmethodID mid = (*env)->GetStaticMethodID(env, cls, "establishVpnInterface", "(Ljava/lang/String;)I");
+    if (!mid) {
+        (*env)->DeleteLocalRef(env, cls);
+        return -1;
+    }
+    jstring j_ip = (*env)->NewStringUTF(env, assigned_ip);
+    jint fd = (*env)->CallStaticIntMethod(env, cls, mid, j_ip);
+    (*env)->DeleteLocalRef(env, j_ip);
+    (*env)->DeleteLocalRef(env, cls);
+    return (int)fd;
+}
+
 /* UDP RX worker thread */
 static void* android_udp_rx_thread(void* arg) {
     android_udp_rx_worker_t* w = (android_udp_rx_worker_t*)arg;
@@ -137,8 +155,10 @@ static void* android_udp_rx_thread(void* arg) {
         uint8_t* tun_pkt = (uint8_t*)malloc(cipher_len);
         if (tun_pkt) {
             lk_chacha20_crypt_packet(w->master_key, nonce, 0, buf + UDP_HDR_SIZE, tun_pkt, cipher_len);
-            write(w->tun_fd, tun_pkt, cipher_len);
-            g_traffic_rx += cipher_len;
+            if (w->tun_fd >= 0) {
+                write(w->tun_fd, tun_pkt, cipher_len);
+                g_traffic_rx += cipher_len;
+            }
             free(tun_pkt);
         }
     }
@@ -146,7 +166,7 @@ static void* android_udp_rx_thread(void* arg) {
 }
 
 /* Run UDP tunnel */
-static int run_udp_client(JNIEnv* env, int fd, const char* srv_addr_cstr, int port, const char* key_cstr) {
+static int run_udp_client(JNIEnv* env, const char* srv_addr_cstr, int port, const char* key_cstr) {
     LOGI("Starting UDP Datagram Tunnel to %s:%d...", srv_addr_cstr, port);
 
     g_udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -190,31 +210,64 @@ static int run_udp_client(JNIEnv* env, int fd, const char* srv_addr_cstr, int po
     setsockopt(g_udp_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     int ack_received = 0;
+    char server_version[64] = "unknown";
+    char assigned_ip[64] = "10.10.10.2";
+
     for (int attempt = 1; attempt <= 4 && g_android_tunnel_running; attempt++) {
         sendto(g_udp_sock, (char*)req, UDP_REQ_LEN, 0, (struct sockaddr *)&srv_addr_in, sizeof(srv_addr_in));
         
-        uint8_t ack_buf[UDP_ACK_LEN];
+        uint8_t ack_buf[UDP_ACK_LEN + 32];
         struct sockaddr_in from;
         socklen_t from_len = sizeof(from);
-        int n = recvfrom(g_udp_sock, (char*)ack_buf, UDP_ACK_LEN, 0, (struct sockaddr *)&from, &from_len);
+        int n = recvfrom(g_udp_sock, (char*)ack_buf, sizeof(ack_buf), 0, (struct sockaddr *)&from, &from_len);
         
-        if (n == UDP_ACK_LEN && memcmp(ack_buf, UDP_MAGIC_ACK, 10) == 0) {
-            uint8_t exp_tag[16];
-            compute_auth_tag(master_key, "LK-UDP-ACK", ack_buf + 10, exp_tag);
-            if (memcmp(exp_tag, ack_buf + 26, 16) == 0) {
+        if (n >= UDP_ACK_LEN && memcmp(ack_buf, UDP_MAGIC_ACK, 10) == 0) {
+            uint8_t *s_nonce = ack_buf + 10;
+            uint8_t *tag = ack_buf + 26;
+            uint8_t exp_tag[32];
+            compute_auth_tag(master_key, "LK-UDP-ACK", s_nonce, exp_tag);
+            if (memcmp(tag, exp_tag, 32) == 0) {
+                snprintf(server_version, sizeof(server_version), "%s", (char *)(ack_buf + 58));
+                char *at = strchr(server_version, '@');
+                if (at) {
+                    *at = '\0';
+                    snprintf(assigned_ip, sizeof(assigned_ip), "%s", at + 1);
+                }
                 ack_received = 1;
-                LOGI("Authentication successful! Connected via UDP.");
+                LOGI("Connected to Server v%s! Assigned IP: %s", server_version, assigned_ip);
                 break;
+            } else {
+                LOGE("AUTHENTICATION FAILED: INVALID ENCRYPTION KEY!");
+                close(g_udp_sock);
+                g_udp_sock = -1;
+                return -1;
             }
         }
+        LOGW("UDP Handshake attempt %d timed out, retrying...", attempt);
     }
 
     if (!ack_received) {
-        LOGE("Failed to connect or authenticate to UDP server!");
+        LOGE("Server %s:%d did not respond on UDP.", srv_addr_cstr, port);
         close(g_udp_sock);
         g_udp_sock = -1;
         return -1;
     }
+
+    /* Reset socket receive timeout for continuous traffic */
+    struct timeval tv_zero = { 0, 0 };
+    setsockopt(g_udp_sock, SOL_SOCKET, SO_RCVTIMEO, &tv_zero, sizeof(tv_zero));
+
+    /* Dynamically establish Android TUN interface with the server assigned IP */
+    LOGI("Configuring Android VPN adapter with IP %s...", assigned_ip);
+    int fd = establish_vpn_via_jvm(env, assigned_ip);
+    if (fd < 0) {
+        LOGE("Failed to establish Android VPN interface");
+        close(g_udp_sock);
+        g_udp_sock = -1;
+        return -1;
+    }
+    g_tun_fd = fd;
+    LOGI("VPN adapter configured! Tunnel is ACTIVE.");
 
     android_udp_rx_worker_t rx_worker;
     rx_worker.tun_fd = fd;
@@ -225,7 +278,11 @@ static int run_udp_client(JNIEnv* env, int fd, const char* srv_addr_cstr, int po
     pthread_t rx_tid;
     pthread_create(&rx_tid, NULL, android_udp_rx_thread, &rx_worker);
 
-    uint32_t counter = 0;
+    uint32_t tx_salt = 0;
+    lk_random_bytes((uint8_t *)&tx_salt, sizeof(tx_salt));
+    uint64_t tx_seq = 0;
+    time_t last_send_time = time(NULL);
+
     uint8_t packet[MAX_PACKET_SIZE];
     uint8_t udp_buf[MAX_PACKET_SIZE + UDP_HDR_SIZE];
 
@@ -234,23 +291,33 @@ static int run_udp_client(JNIEnv* env, int fd, const char* srv_addr_cstr, int po
     pfd.events = POLLIN;
 
     while (g_android_tunnel_running) {
-        int pr = poll(&pfd, 1, 100); /* 100ms wait so we can check g_android_tunnel_running */
+        int pr = poll(&pfd, 1, 100);
         if (pr > 0 && (pfd.revents & POLLIN)) {
             int packet_size = read(fd, packet, sizeof(packet));
-            if (packet_size > 0) {
-                counter++;
+            if (packet_size > 0 && packet_size <= MAX_PACKET_SIZE) {
+                uint64_t seq = ++tx_seq;
+                memcpy(udp_buf, &tx_salt, 4);
+                memcpy(udp_buf + 4, &seq, 8);
                 uint8_t nonce[12];
-                memset(nonce, 0, 12);
-                nonce[0] = (counter >> 24) & 0xFF;
-                nonce[1] = (counter >> 16) & 0xFF;
-                nonce[2] = (counter >> 8) & 0xFF;
-                nonce[3] = counter & 0xFF;
+                memcpy(nonce, udp_buf, 12);
 
-                memcpy(udp_buf, nonce, 12);
-                lk_chacha20_crypt_packet(master_key, nonce, 0, packet, udp_buf + UDP_HDR_SIZE, packet_size);
-                
-                g_traffic_tx += packet_size;
+                lk_chacha20_crypt_packet(master_key, nonce, 0, packet, udp_buf + UDP_HDR_SIZE, (size_t)packet_size);
                 sendto(g_udp_sock, (char*)udp_buf, packet_size + UDP_HDR_SIZE, 0, (struct sockaddr *)&srv_addr_in, sizeof(srv_addr_in));
+                g_traffic_tx += packet_size;
+                last_send_time = time(NULL);
+            }
+        } else {
+            /* Keepalive ping every 15s to keep NAT mapping alive */
+            if (time(NULL) - last_send_time > 15) {
+                uint64_t seq = ++tx_seq;
+                memcpy(udp_buf, &tx_salt, 4);
+                memcpy(udp_buf + 4, &seq, 8);
+                uint8_t nonce[12];
+                memcpy(nonce, udp_buf, 12);
+                uint32_t ping_magic = UDP_PING_MAGIC;
+                lk_chacha20_crypt_packet(master_key, nonce, 0, (const uint8_t *)&ping_magic, udp_buf + UDP_HDR_SIZE, 4);
+                sendto(g_udp_sock, (char*)udp_buf, 4 + UDP_HDR_SIZE, 0, (struct sockaddr *)&srv_addr_in, sizeof(srv_addr_in));
+                last_send_time = time(NULL);
             }
         }
     }
@@ -264,7 +331,7 @@ static int run_udp_client(JNIEnv* env, int fd, const char* srv_addr_cstr, int po
 }
 
 /* Run TCP tunnel (Single or Multi-lane) */
-static int run_tcp_client(JNIEnv* env, int fd, const char* srv_addr_cstr, int port, const char* key_cstr, int lanes) {
+static int run_tcp_client(JNIEnv* env, const char* srv_addr_cstr, int port, const char* key_cstr, int lanes) {
     LOGI("Starting TCP Tunnel (%d Lanes) to %s:%d...", lanes, srv_addr_cstr, port);
 
     socket_t sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -388,6 +455,18 @@ static int run_tcp_client(JNIEnv* env, int fd, const char* srv_addr_cstr, int po
         g_tcp_socks[i] = socks[i];
     }
 
+    /* Dynamically establish Android TUN interface with the server assigned IP */
+    LOGI("Configuring Android VPN adapter with IP %s...", assigned_ip);
+    int fd = establish_vpn_via_jvm(env, assigned_ip);
+    if (fd < 0) {
+        LOGE("Failed to establish Android VPN interface");
+        for (int i = 0; i < num_conns; i++) CLOSE_SOCK(socks[i]);
+        g_num_tcp_socks = 0;
+        return -1;
+    }
+    g_tun_fd = fd;
+    LOGI("VPN adapter configured! Tunnel is ACTIVE.");
+
     uint8_t key_c2s[32], key_s2c[32];
     derive_direction_key(master_key, "C2S", c_nonce, key_c2s);
     derive_direction_key(master_key, "S2C", s_nonce, key_s2c);
@@ -403,8 +482,6 @@ static int run_tcp_client(JNIEnv* env, int fd, const char* srv_addr_cstr, int po
         lk_chacha20_init(&ctx_tx[i], key_c2s, lane_c_nonce, 1);
         lk_chacha20_init(&ctx_rx[i], key_s2c, lane_s_nonce, 1);
     }
-
-    LOGI("TCP Tunnel established and active!");
 
     /* Set TUN FD non-blocking */
     int flags = fcntl(fd, F_GETFL, 0);
@@ -471,18 +548,16 @@ static int run_tcp_client(JNIEnv* env, int fd, const char* srv_addr_cstr, int po
 
 static jint internal_startNativeTunnel(
         JNIEnv* env,
-        jint fd,
         jstring serverAddr,
         jint port,
         jstring key,
         jint mode) {
         
-    if (!serverAddr || !key || fd < 0) {
+    if (!serverAddr || !key) {
         LOGE("Invalid arguments passed to startNativeTunnel");
         return -1;
     }
 
-    g_tun_fd = fd;
     g_android_tunnel_running = 1;
     g_traffic_tx = 0;
     g_traffic_rx = 0;
@@ -492,9 +567,9 @@ static jint internal_startNativeTunnel(
 
     int res = 0;
     if (mode == 0) {
-        res = run_udp_client(env, fd, srv_addr_cstr, port, key_cstr);
+        res = run_udp_client(env, srv_addr_cstr, port, key_cstr);
     } else {
-        res = run_tcp_client(env, fd, srv_addr_cstr, port, key_cstr, mode);
+        res = run_tcp_client(env, srv_addr_cstr, port, key_cstr, mode);
     }
 
     (*env)->ReleaseStringUTFChars(env, serverAddr, srv_addr_cstr);
@@ -518,16 +593,16 @@ static void internal_stopNativeTunnel(void) {
 /* JNI Bindings for TunnelVpnService (direct and Companion) */
 JNIEXPORT jint JNICALL
 Java_com_example_livekadehtunnel_TunnelVpnService_startNativeTunnel(
-        JNIEnv* env, jobject thiz, jint fd, jstring serverAddr, jint port, jstring key, jint mode) {
+        JNIEnv* env, jobject thiz, jstring serverAddr, jint port, jstring key, jint mode) {
     (void)thiz;
-    return internal_startNativeTunnel(env, fd, serverAddr, port, key, mode);
+    return internal_startNativeTunnel(env, serverAddr, port, key, mode);
 }
 
 JNIEXPORT jint JNICALL
 Java_com_example_livekadehtunnel_TunnelVpnService_00024Companion_startNativeTunnel(
-        JNIEnv* env, jobject thiz, jint fd, jstring serverAddr, jint port, jstring key, jint mode) {
+        JNIEnv* env, jobject thiz, jstring serverAddr, jint port, jstring key, jint mode) {
     (void)thiz;
-    return internal_startNativeTunnel(env, fd, serverAddr, port, key, mode);
+    return internal_startNativeTunnel(env, serverAddr, port, key, mode);
 }
 
 JNIEXPORT void JNICALL
