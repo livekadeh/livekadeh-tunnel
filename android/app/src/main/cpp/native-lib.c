@@ -403,6 +403,10 @@ static int run_tcp_client(JNIEnv* env, const char* srv_addr_cstr, int port, cons
     uint8_t master_key[32];
     derive_master_key(key_cstr, master_key);
 
+    struct timeval to = { 4, 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &to, sizeof(to));
+
     LOGI("Sending challenge authentication probe via TCP...");
     uint8_t c_nonce[AUTH_NONCE_SIZE], s_nonce[AUTH_NONCE_SIZE];
     char server_version[64] = "unknown";

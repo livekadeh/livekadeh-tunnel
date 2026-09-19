@@ -252,11 +252,15 @@ static inline int read_exact(socket_t sock, uint8_t *buf, size_t len) {
     return 0;
 }
 
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
 /* Write exact n bytes */
 static inline int write_exact(socket_t sock, const uint8_t *buf, size_t len) {
     size_t total = 0;
     while (total < len) {
-        int n = send(sock, (const char *)buf + total, (int)(len - total), 0);
+        int n = send(sock, (const char *)buf + total, (int)(len - total), MSG_NOSIGNAL);
         if (n <= 0) return -1;
         total += (size_t)n;
     }

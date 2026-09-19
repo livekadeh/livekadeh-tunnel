@@ -152,30 +152,44 @@ static void *linux_tun_outbound_router_thread(void *arg) {
         if (buf[16] == 10 && buf[17] == 10 && buf[18] == 10) {
             uint8_t dst_host = buf[19];
             if (dst_host >= CLIENT_IP_START && dst_host <= CLIENT_IP_END) {
+                socket_t target_sock = INVALID_SOCKET;
+                int client_type = 0;
+                int lane = 0;
+                struct sockaddr_in udp_dest;
+                uint64_t udp_seq = 0;
+                uint32_t udp_salt = 0;
+
                 pthread_mutex_lock(&g_sessions_lock);
                 if (g_clients[dst_host].active) {
-                    if (g_clients[dst_host].type == CLIENT_TYPE_TCP) {
+                    client_type = g_clients[dst_host].type;
+                    if (client_type == CLIENT_TYPE_TCP) {
                         int num_c = g_clients[dst_host].num_conns;
                         if (num_c > 0) {
-                            int lane = (int)(flow_hash_packet(buf, (size_t)n) % (uint32_t)num_c);
-                            send_tun_packet(g_clients[dst_host].socks[lane], &g_clients[dst_host].ctx_tx[lane], buf, (uint16_t)n);
-                            g_traffic_tx_bytes += (uint64_t)n;
+                            lane = (int)(flow_hash_packet(buf, (size_t)n) % (uint32_t)num_c);
+                            target_sock = g_clients[dst_host].socks[lane];
                         }
-                    } else if (g_clients[dst_host].type == CLIENT_TYPE_UDP && IS_VALIDSOCK(g_server_udp_sock)) {
-                        uint64_t seq = ++g_clients[dst_host].udp_tx_seq;
-                        uint32_t salt = g_clients[dst_host].udp_tx_salt;
-                        uint8_t out[MAX_PACKET_SIZE + UDP_HDR_SIZE];
-                        memcpy(out, &salt, 4);
-                        memcpy(out + 4, &seq, 8);
-                        uint8_t nonce[12];
-                        memcpy(nonce, out, 12);
-                        lk_chacha20_crypt_packet(g_server_master_key, nonce, 0, buf, out + UDP_HDR_SIZE, (size_t)n);
-                        sendto(g_server_udp_sock, (const char *)out, (size_t)n + UDP_HDR_SIZE, 0,
-                               (struct sockaddr *)&g_clients[dst_host].udp_addr, sizeof(struct sockaddr_in));
-                        g_traffic_tx_bytes += (uint64_t)n;
+                    } else if (client_type == CLIENT_TYPE_UDP && IS_VALIDSOCK(g_server_udp_sock)) {
+                        udp_seq = ++g_clients[dst_host].udp_tx_seq;
+                        udp_salt = g_clients[dst_host].udp_tx_salt;
+                        memcpy(&udp_dest, &g_clients[dst_host].udp_addr, sizeof(udp_dest));
                     }
                 }
                 pthread_mutex_unlock(&g_sessions_lock);
+
+                if (client_type == CLIENT_TYPE_TCP && IS_VALIDSOCK(target_sock)) {
+                    send_tun_packet(target_sock, &g_clients[dst_host].ctx_tx[lane], buf, (uint16_t)n);
+                    g_traffic_tx_bytes += (uint64_t)n;
+                } else if (client_type == CLIENT_TYPE_UDP && IS_VALIDSOCK(g_server_udp_sock)) {
+                    uint8_t out[MAX_PACKET_SIZE + UDP_HDR_SIZE];
+                    memcpy(out, &udp_salt, 4);
+                    memcpy(out + 4, &udp_seq, 8);
+                    uint8_t nonce[12];
+                    memcpy(nonce, out, 12);
+                    lk_chacha20_crypt_packet(g_server_master_key, nonce, 0, buf, out + UDP_HDR_SIZE, (size_t)n);
+                    sendto(g_server_udp_sock, (const char *)out, (size_t)n + UDP_HDR_SIZE, 0,
+                           (struct sockaddr *)&udp_dest, sizeof(struct sockaddr_in));
+                    g_traffic_tx_bytes += (uint64_t)n;
+                }
             }
         }
     }
@@ -225,10 +239,7 @@ static void *linux_tcp_client_worker(void *arg) {
         for (int i = 0; i < num_c; i++) {
             if (FD_ISSET(socks[i], &rfds)) {
                 uint16_t plen = 0;
-                pthread_mutex_lock(&g_sessions_lock);
-                lk_chacha20_ctx *p_ctx = &g_clients[ip_host].ctx_rx[i];
-                int r = recv_tun_packet(socks[i], p_ctx, buf, &plen);
-                pthread_mutex_unlock(&g_sessions_lock);
+                int r = recv_tun_packet(socks[i], &g_clients[ip_host].ctx_rx[i], buf, &plen);
                 if (r != 0) {
                     drop = 1;
                     break;
@@ -239,11 +250,7 @@ static void *linux_tcp_client_worker(void *arg) {
                 }
                 pthread_mutex_unlock(&g_tun_write_lock);
 
-                pthread_mutex_lock(&g_sessions_lock);
-                if (g_clients[ip_host].active) {
-                    g_clients[ip_host].last_seen = time(NULL);
-                }
-                pthread_mutex_unlock(&g_sessions_lock);
+                g_clients[ip_host].last_seen = time(NULL);
             }
         }
         if (drop) break;
@@ -255,7 +262,9 @@ static void *linux_tcp_client_worker(void *arg) {
                ip_host, g_clients[ip_host].remote_ip, g_clients[ip_host].remote_port);
         for (int i = 0; i < g_clients[ip_host].num_conns; i++) {
             CLOSE_SOCK(g_clients[ip_host].socks[i]);
+            g_clients[ip_host].socks[i] = INVALID_SOCKET;
         }
+        g_clients[ip_host].num_conns = 0;
         g_clients[ip_host].active = 0;
     }
     pthread_mutex_unlock(&g_sessions_lock);
@@ -592,8 +601,9 @@ static inline int run_linux_tun_server(int listen_port, const char *key) {
                 continue;
             }
 
-            struct timeval tv_zero = { 0, 0 };
-            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv_zero, sizeof(tv_zero));
+            struct timeval tv_rw = { 10, 0 };
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv_rw, sizeof(tv_rw));
+            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv_rw, sizeof(tv_rw));
             tune_tunnel_socket(sock);
 
             uint8_t key_c2s[32], key_s2c[32];
@@ -668,8 +678,9 @@ static inline int run_linux_tun_server(int listen_port, const char *key) {
                     compute_auth_tag(g_server_master_key, "LK-ATTACH-OK", ack_pkt, ack_pkt + AUTH_NONCE_SIZE + 16);
                     write_exact(sock, ack_pkt, ATTACH_PACKET_SIZE);
 
-                    struct timeval tv_zero = { 0, 0 };
-                    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv_zero, sizeof(tv_zero));
+                    struct timeval tv_rw = { 10, 0 };
+                    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv_rw, sizeof(tv_rw));
+                    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv_rw, sizeof(tv_rw));
                     tune_tunnel_socket(sock);
 
                     g_clients[found_host].socks[lane_idx] = sock;
