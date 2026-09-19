@@ -7,6 +7,11 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <shellapi.h>
+
+#define WM_TRAYICON (WM_USER + 1)
+static NOTIFYICONDATAA g_nid;
+
 #include <shlobj.h>
 #include <shellapi.h>
 #include <stdio.h>
@@ -718,6 +723,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     switch (msg) {
         case WM_CREATE: {
             g_hMainWnd = hwnd;
+            memset(&g_nid, 0, sizeof(g_nid));
+            g_nid.cbSize = sizeof(g_nid);
+            g_nid.hWnd = hwnd;
+            g_nid.uID = 1;
+            g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+            g_nid.uCallbackMessage = WM_TRAYICON;
+            g_nid.hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(1));
+            strcpy(g_nid.szTip, "Livekadeh Tunnel");
+            Shell_NotifyIconA(NIM_ADD, &g_nid);
+
             HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 
             g_hTerminalBrush = CreateSolidBrush(RGB(15, 23, 42));
@@ -858,6 +873,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             log_append(LOG_LEVEL_INFO, "Default mode: Wintun virtual network adapter (10.10.10.2 <-> 10.10.10.1)");
             break;
         }
+
+        case WM_SYSCOMMAND:
+            if ((wParam & 0xFFF0) == SC_MINIMIZE) {
+                ShowWindow(hwnd, SW_HIDE);
+                return 0;
+            }
+            return DefWindowProc(hwnd, msg, wParam, lParam);
+
+        case WM_TRAYICON:
+            if (lParam == WM_LBUTTONUP || lParam == WM_LBUTTONDBLCLK) {
+                ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+            }
+            break;
 
         case WM_CTLCOLOREDIT:
         case WM_CTLCOLORSTATIC: {
@@ -1084,6 +1113,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             stop_active_tunnel();
             if (g_hTerminalBrush) DeleteObject(g_hTerminalBrush);
             if (g_hTerminalFont) DeleteObject(g_hTerminalFont);
+            Shell_NotifyIconA(NIM_DELETE, &g_nid);
             PostQuitMessage(0);
             break;
 
