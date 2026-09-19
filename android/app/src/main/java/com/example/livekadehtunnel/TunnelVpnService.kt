@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -23,6 +24,10 @@ class TunnelVpnService : VpnService() {
 
         @Volatile
         var isRunning: Boolean = false
+            private set
+
+        @Volatile
+        var instance: TunnelVpnService? = null
             private set
 
         init {
@@ -46,10 +51,21 @@ class TunnelVpnService : VpnService() {
 
         @JvmStatic
         external fun clearNativeLogs()
+
+        @JvmStatic
+        fun protectSocket(fd: Int): Boolean {
+            val s = instance
+            return if (s != null) {
+                s.protect(fd)
+            } else {
+                false
+            }
+        }
     }
 
     override fun onCreate() {
         super.onCreate()
+        instance = this
         createNotificationChannel()
     }
 
@@ -65,7 +81,17 @@ class TunnelVpnService : VpnService() {
         val key = intent.getStringExtra("key") ?: return START_NOT_STICKY
         val mode = intent.getIntExtra("mode", 0)
 
-        startForeground(NOTIF_ID, buildNotification("Livekadeh Tunnel Active ($serverAddr:$port)"))
+        try {
+            val notif = buildNotification("Livekadeh Tunnel ($serverAddr:$port)")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            } else {
+                startForeground(NOTIF_ID, notif)
+            }
+        } catch (t: Throwable) {
+            Log.w("TunnelVPN", "Could not startForeground: ${t.message}")
+        }
+
         startTunnel(serverAddr, port, key, mode)
         return START_STICKY
     }
@@ -78,17 +104,16 @@ class TunnelVpnService : VpnService() {
             .addDnsServer("1.1.1.1")
             .addDnsServer("8.8.8.8")
             .setMtu(1400)
-            .setBlocking(false)
 
         try {
             vpnInterface = builder.establish()
-        } catch (e: Exception) {
-            Log.e("TunnelVPN", "Exception creating VPN interface", e)
+        } catch (e: Throwable) {
+            Log.e("TunnelVPN", "Exception establishing VPN interface", e)
         }
 
         val fd = vpnInterface?.fd ?: -1
         if (fd < 0) {
-            Log.e("TunnelVPN", "Failed to establish VPN interface")
+            Log.e("TunnelVPN", "Failed to establish VPN interface (fd < 0)")
             stopSelf()
             return
         }
@@ -96,7 +121,11 @@ class TunnelVpnService : VpnService() {
         isRunning = true
         vpnThread = Thread {
             Log.i("TunnelVPN", "Starting native tunnel on fd $fd, mode=$mode")
-            startNativeTunnel(fd, serverAddr, port, key, mode)
+            try {
+                startNativeTunnel(fd, serverAddr, port, key, mode)
+            } catch (t: Throwable) {
+                Log.e("TunnelVPN", "Native tunnel crashed or failed", t)
+            }
             Log.i("TunnelVPN", "Native tunnel finished")
             isRunning = false
             stopSelf()
@@ -106,19 +135,28 @@ class TunnelVpnService : VpnService() {
 
     private fun stopTunnel() {
         isRunning = false
-        stopNativeTunnel()
+        try {
+            stopNativeTunnel()
+        } catch (t: Throwable) {
+            Log.w("TunnelVPN", "Error stopping native tunnel: ${t.message}")
+        }
         try {
             vpnInterface?.close()
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.e("TunnelVPN", "Error closing vpnInterface", e)
         }
         vpnInterface = null
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        try {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } catch (t: Throwable) {
+            // Ignored
+        }
         stopSelf()
     }
 
     override fun onDestroy() {
         stopTunnel()
+        instance = null
         super.onDestroy()
     }
 
@@ -151,7 +189,7 @@ class TunnelVpnService : VpnService() {
         return builder
             .setContentTitle("Livekadeh Tunnel")
             .setContentText(text)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .build()

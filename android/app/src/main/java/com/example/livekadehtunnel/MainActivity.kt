@@ -3,6 +3,7 @@ package com.example.livekadehtunnel
 import android.content.Intent
 import android.net.VpnService
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -24,7 +25,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
@@ -36,6 +36,8 @@ class MainActivity : ComponentActivity() {
     private val vpnRequest = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == RESULT_OK) {
             startVpnService()
+        } else {
+            Log.w("MainActivity", "VPN permission was not granted by user")
         }
     }
 
@@ -60,18 +62,27 @@ class MainActivity : ComponentActivity() {
                             pendingPort = port
                             pendingKey = key
                             pendingMode = mode
-                            val intent = VpnService.prepare(this)
-                            if (intent != null) {
-                                vpnRequest.launch(intent)
-                            } else {
+                            try {
+                                val intent = VpnService.prepare(this)
+                                if (intent != null) {
+                                    vpnRequest.launch(intent)
+                                } else {
+                                    startVpnService()
+                                }
+                            } catch (t: Throwable) {
+                                Log.e("MainActivity", "VpnService.prepare failed", t)
                                 startVpnService()
                             }
                         },
                         onDisconnect = {
-                            val intent = Intent(this, TunnelVpnService::class.java).apply {
-                                action = TunnelVpnService.ACTION_DISCONNECT
+                            try {
+                                val intent = Intent(this, TunnelVpnService::class.java).apply {
+                                    action = TunnelVpnService.ACTION_DISCONNECT
+                                }
+                                startService(intent)
+                            } catch (t: Throwable) {
+                                Log.e("MainActivity", "Failed to send disconnect intent", t)
                             }
-                            startService(intent)
                         }
                     )
                 }
@@ -87,10 +98,17 @@ class MainActivity : ComponentActivity() {
             putExtra("key", pendingKey)
             putExtra("mode", pendingMode)
         }
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
+        try {
             startService(intent)
+        } catch (t: Throwable) {
+            Log.w("MainActivity", "startService failed, attempting startForegroundService", t)
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                try {
+                    startForegroundService(intent)
+                } catch (e: Throwable) {
+                    Log.e("MainActivity", "startForegroundService also failed", e)
+                }
+            }
         }
     }
 }
@@ -142,7 +160,6 @@ fun TunnelScreen(
     var totalRx by remember { mutableStateOf(0L) }
     var logText by remember { mutableStateOf("") }
 
-    val coroutineScope = rememberCoroutineScope()
     val scrollState = rememberScrollState()
 
     // Periodic statistics & log updater
@@ -150,26 +167,30 @@ fun TunnelScreen(
         var lastTx = 0L
         var lastRx = 0L
         while (true) {
-            val running = TunnelVpnService.isRunning
-            isConnected = running
+            try {
+                val running = TunnelVpnService.isRunning
+                isConnected = running
 
-            val curTx = TunnelVpnService.getTxBytes()
-            val curRx = TunnelVpnService.getRxBytes()
+                val curTx = TunnelVpnService.getTxBytes()
+                val curRx = TunnelVpnService.getRxBytes()
 
-            if (running) {
-                txSpeed = (curTx - lastTx).coerceAtLeast(0L)
-                rxSpeed = (curRx - lastRx).coerceAtLeast(0L)
-            } else {
-                txSpeed = 0L
-                rxSpeed = 0L
+                if (running) {
+                    txSpeed = (curTx - lastTx).coerceAtLeast(0L)
+                    rxSpeed = (curRx - lastRx).coerceAtLeast(0L)
+                } else {
+                    txSpeed = 0L
+                    rxSpeed = 0L
+                }
+
+                lastTx = curTx
+                lastRx = curRx
+                totalTx = curTx
+                totalRx = curRx
+
+                logText = TunnelVpnService.getNativeLogs()
+            } catch (t: Throwable) {
+                // Ignore stats polling error
             }
-
-            lastTx = curTx
-            lastRx = curRx
-            totalTx = curTx
-            totalRx = curRx
-
-            logText = TunnelVpnService.getNativeLogs()
 
             delay(1000)
         }
@@ -264,7 +285,7 @@ fun TunnelScreen(
                         colors = ExposedDropdownMenuDefaults.outlinedTextFieldColors(),
                         enabled = !isConnected,
                         modifier = Modifier
-                            .menuAnchor()
+                            .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable, true)
                             .fillMaxWidth()
                     )
                     ExposedDropdownMenu(
